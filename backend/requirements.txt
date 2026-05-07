@@ -1,0 +1,18 @@
+fastapi
+uvicorn[standard]
+websockets
+python-dotenv
+langchain
+langchain-community
+langchain-huggingface
+faiss-cpu
+sentence-transformers
+deepgram-sdk
+google-genai
+openai
+sarvamai
+httpx
+edge-tts
+numpy>=1.26.0     # already a transitive dep, now explicit
+scipy>=1.13.0     # polyphase resampling
+pydub>=0.25.1     # MP3→PCM decode for edge-tts fallback
