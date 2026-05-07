@@ -860,766 +860,794 @@
 
 
 
-"""
-main.py — Suvit Voice Agent
-────────────────────────────
-FastAPI server exposing:
-
-  GET  /health              — liveness + dependency check
-  GET  /test                — browser test console (HTML)
-  POST /transcribe          — STT only (file upload)
-  GET  /retrieve            — RAG retriever test (text query)
-  POST /ask                 — text in → text out (no audio)
-  POST /ask_voice           — text in → MP3 out
-  POST /voice_to_voice      — audio file in → MP3 out
-  WS   /ws/voice            — full streaming voice pipeline
-
-Services:
-  STT         : Deepgram nova-3  (language=multi → en/hi/gu)
-  Translation : OpenAI GPT-4o-mini (primary) → Gemini 2.5 Flash (fallback)
-  Generation  : Gemini 2.5 Flash (primary)   → OpenAI GPT-4o-mini (fallback)
-  TTS         : Sarvam Bulbul v3 (primary)   → edge-tts (fallback)
-"""
-
-import os
-import json
-import base64
-import urllib.parse
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from dotenv import load_dotenv
-
-load_dotenv()
-
-from agents.graph import agent_graph
-from agents.state import VoiceState
-from services.deepgram_stt import transcribe
-from services.sarvam_tts import synthesize, synthesize_stream
-from services.gemini_translate import (
-    translate_to_english,
-    generate_answer,
-)
-from services.realtime_voice import RealtimeVoiceSession
-from services.voice_pipeline import run_voice_pipeline
-from kb.retriever import retrieve
-
-app = FastAPI(title="Suvit Voice Agent", version="2.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─── Health ──────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-async def health():
-    checks: dict = {}
-
-    try:
-        from kb.retriever import get_vectorstore
-        get_vectorstore()
-        checks["faiss_index"] = "ok"
-    except Exception as e:
-        checks["faiss_index"] = f"error: {e}"
-
-    checks["deepgram_key"]  = "ok" if os.environ.get("DEEPGRAM_API_KEY")  else "missing"
-    checks["openai_key"]    = "ok" if os.environ.get("OPENAI_API_KEY")    else "missing"
-    checks["gemini_key"]    = "ok" if os.environ.get("GOOGLE_API_KEY")    else "missing"
-    checks["sarvam_key"]    = "ok" if os.environ.get("SARVAMAI_API_KEY")  else "missing (edge-tts fallback active)"
-
-    all_ok = all("error" not in v and "missing" not in v for v in checks.values()
-                 if "fallback" not in v)
-    return {"status": "ok" if all_ok else "degraded", "checks": checks}
-
-
-# ─── STT test ────────────────────────────────────────────────────────────────
-
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    """Upload any audio file → get transcript + detected language."""
-    audio_bytes = await file.read()
-    transcript, lang = await transcribe(audio_bytes)
-    return {"transcript": transcript, "detected_language": lang}
-
-
-# ─── RAG test ────────────────────────────────────────────────────────────────
-
-@app.get("/retrieve")
-async def retrieve_chunks(q: str, k: int = 3):
-    """Test FAISS retriever with a plain English query."""
-    chunks = retrieve(q, k=k)
-    return {"query": q, "chunks": chunks}
-
-
-# ─── Text → text ─────────────────────────────────────────────────────────────
-
-@app.post("/ask")
-async def ask_text(body: dict):
-    """
-    Full pipeline without audio.
-    Body: { "question": "...", "language": "en" | "hi" | "gu" }
-    """
-    question = body.get("question", "")
-    language = body.get("language", "en")
-
-    english_q = await translate_to_english(question, language)
-    chunks    = retrieve(english_q)
-    answer    = await generate_answer(english_q, chunks, language)
-
-    return {
-        "question":         question,
-        "language":         language,
-        "english_query":    english_q,
-        "retrieved_chunks": chunks,
-        "answer":           answer,
-    }
-
-
-# ─── Text → voice ────────────────────────────────────────────────────────────
-
-@app.post("/ask_voice")
-async def ask_voice(body: dict):
-    """
-    Text question → MP3 audio response.
-    Body: { "question": "...", "language": "en" | "hi" | "gu" }
-    """
-    question = body.get("question", "")
-    language = body.get("language", "en")
-
-    english_q   = await translate_to_english(question, language)
-    chunks      = retrieve(english_q)
-    answer      = await generate_answer(english_q, chunks, language)
-    audio_bytes = await synthesize(answer, language)
-
-    return Response(content=audio_bytes, media_type="audio/mpeg")
-
-
-# ─── Voice file → voice ───────────────────────────────────────────────────────
-
-@app.post("/voice_to_voice")
-async def voice_to_voice(file: UploadFile = File(...)):
-    """
-    Upload audio → get back MP3 audio answer in the user's language.
-
-    Response headers:
-        X-Transcript : URL-encoded transcript
-        X-Language   : detected language code (en / hi / gu)
-    """
-    audio_bytes = await file.read()
-
-    try:
-        result = await run_voice_pipeline(audio_bytes, k=5, mime_type=file.content_type)
-    except Exception as e:
-        print(f"[V2V] STT failed: {e}")
-        # Fallback: return a spoken error message instead of crashing
-        try:
-            audio_out = await synthesize(
-                "Sorry, I couldn't process your audio. The speech service is temporarily unavailable. Please try again.", "en"
-            )
-            return Response(
-                content=audio_out,
-                media_type="audio/mpeg",
-                headers={
-                    "X-Transcript": urllib.parse.quote("STT error"),
-                    "X-Language":   "en",
-                },
-            )
-        except Exception:
-            return Response(
-                content=b"",
-                media_type="audio/mpeg",
-                headers={"X-Transcript": "STT+TTS error", "X-Language": "en"},
-            )
-
-    print(
-        f"[V2V] transcript='{result.transcript}' | lang={result.input_language} | "
-        f"english_query='{result.english_query}' | chunks={len(result.retrieved_chunks)}"
-    )
-
-    return Response(
-        content=result.audio_bytes,
-        media_type="audio/mpeg",
-        headers={
-            "X-Transcript": urllib.parse.quote(result.transcript),
-            "X-Language": result.input_language,
-        },
-    )
-
-
-# ─── WebSocket: full streaming voice pipeline ─────────────────────────────────
-
-@app.websocket("/ws/voice")
-async def voice_endpoint(ws: WebSocket):
-    """
-    WebSocket voice pipeline with streaming TTS.
-
-    Client message types (JSON):
-        { "type": "audio_chunk", "audio": "<base64>" }  — send while recording
-        { "type": "audio_end" }                          — signals end of recording
-
-    Server message types (JSON):
-        { "type": "status",      "message": "..." }
-        { "type": "transcript",  "user": "...", "language": "...",
-                                 "english_query": "...", "chunks_used": N }
-        { "type": "audio_start" }
-        { "type": "audio_chunk", "data": "<base64>" }    — streaming TTS audio
-        { "type": "audio_end" }
-        { "type": "error",       "message": "..." }
-    """
-    await ws.accept()
-    session = RealtimeVoiceSession(ws)
-    audio_chunks: list[bytes] = []
-
-    try:
-        await session.start()
-
-        while True:
-            message = await ws.receive()
-
-            if message.get("bytes") is not None:
-                await session.process_audio_chunk(message["bytes"])
-                continue
-
-            text_payload = message.get("text")
-            if text_payload is None:
-                continue
-
-            data = json.loads(text_payload)
-            msg_type = data.get("type")
-
-            if msg_type == "interrupt":
-                await session.interrupt()
-                continue
-
-            if msg_type == "ping":
-                await ws.send_json({"type": "pong"})
-                continue
-
-            # ── Accumulate audio chunks ──────────────────────────────────────
-            if msg_type == "audio_chunk":
-                audio_chunks.append(base64.b64decode(data["audio"]))
-                continue
-
-            # ── End of audio — run full pipeline ────────────────────────────
-            if msg_type == "audio_end":
-                audio_bytes  = b"".join(audio_chunks)
-                audio_chunks = []
-
-                if not audio_bytes:
-                    await ws.send_json({"type": "error", "message": "No audio received."})
-                    continue
-
-                await ws.send_json({"type": "status", "message": "Transcribing..."})
-                await ws.send_json({"type": "status", "message": "Thinking..."})
-                try:
-                    result = await run_voice_pipeline(audio_bytes, k=5)
-                except Exception as e:
-                    await ws.send_json({"type": "error", "message": str(e)})
-                    continue
-
-                await ws.send_json({
-                    "type": "transcript",
-                    "user": result.transcript,
-                    "language": result.input_language,
-                    "english_query": result.english_query,
-                    "chunks_used": len(result.retrieved_chunks),
-                })
-
-                await ws.send_json({"type": "audio_start"})
-                audio_b64 = base64.b64encode(result.audio_bytes).decode()
-                await ws.send_json({"type": "audio_chunk", "data": audio_b64})
-                await ws.send_json({"type": "audio_end"})
-                continue
-
-            # ── Legacy payload: { "audio": "<base64>" } (single-shot) ────────
-            if "audio" in data and msg_type is None:
-                await ws.send_json({"type": "status", "message": "Transcribing..."})
-                await ws.send_json({"type": "status", "message": "Thinking..."})
-                audio_bytes = base64.b64decode(data["audio"])
-                mime_type = data.get("mime")
-                try:
-                    result = await run_voice_pipeline(audio_bytes, k=5, mime_type=mime_type)
-                except Exception as e:
-                    await ws.send_json({"type": "error", "message": str(e)})
-                    continue
-
-                await ws.send_json({
-                    "type": "transcript",
-                    "user": result.transcript,
-                    "language": result.input_language,
-                    "english_query": result.english_query,
-                    "chunks_used": len(result.retrieved_chunks),
-                })
-
-                await ws.send_json({"type": "audio_start"})
-                audio_b64 = base64.b64encode(result.audio_bytes).decode()
-                await ws.send_json({"type": "audio_chunk", "data": audio_b64})
-                await ws.send_json({"type": "audio_end"})
-
-    except WebSocketDisconnect:
-        await session.close()
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        try:
-            await ws.send_json({"type": "error", "message": str(e)})
-        except Exception:
-            pass
-        await session.close()
-
-
-# ─── Browser test page ────────────────────────────────────────────────────────
-
-@app.get("/test", response_class=HTMLResponse)
-async def test_page():
-    return HTMLResponse(TEST_PAGE_HTML)
-
-
-TEST_PAGE_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Suvit Voice Agent — Test</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; background: #f5f5f0; color: #1a1a18; padding: 2rem; }
-  h1 { font-size: 1.3rem; font-weight: 500; margin-bottom: 0.25rem; }
-  .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 2rem; }
-
-  .card { background: #fff; border: 0.5px solid #ddd; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
-  .card h2 { font-size: 0.9rem; font-weight: 500; color: #444; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.04em; }
-
-  label { font-size: 0.85rem; color: #555; display: block; margin-bottom: 4px; }
-  input[type=text], textarea, select {
-    width: 100%; padding: 8px 10px; border: 0.5px solid #ccc;
-    border-radius: 8px; font-size: 0.9rem; font-family: inherit;
-    background: #fafaf8; color: #1a1a18; margin-bottom: 12px;
-  }
-  textarea { min-height: 80px; resize: vertical; }
-  button {
-    padding: 8px 18px; border-radius: 8px; border: 0.5px solid #bbb;
-    background: #fff; font-size: 0.875rem; cursor: pointer; font-family: inherit;
-  }
-  button:hover { background: #f0efeb; }
-  button.primary { background: #378ADD; color: #fff; border-color: #185FA5; }
-  button.primary:hover { background: #2e78cc; }
-  button.danger { background: #D85A30; color: #fff; border-color: #993C1D; }
-
-  #mic-btn { width: 72px; height: 72px; border-radius: 50%; font-size: 1.6rem; border: none; }
-  .mic-row { display: flex; align-items: center; gap: 16px; margin-bottom: 1rem; }
-  .mic-status { font-size: 0.85rem; color: #666; }
-
-  .log { background: #f9f8f5; border: 0.5px solid #e0e0d8; border-radius: 8px;
-    padding: 12px; font-family: monospace; font-size: 0.8rem; min-height: 80px;
-    max-height: 260px; overflow-y: auto; white-space: pre-wrap; color: #333; }
-
-  .tabs { display: flex; gap: 8px; margin-bottom: 1rem; flex-wrap: wrap; }
-  .tab { padding: 6px 14px; border-radius: 8px; border: 0.5px solid #ccc;
-    font-size: 0.85rem; cursor: pointer; background: #fff; }
-  .tab.active { background: #1a1a18; color: #fff; border-color: #1a1a18; }
-
-  .section { display: none; }
-  .section.active { display: block; }
-  audio { width: 100%; margin-top: 10px; }
-  .chunk { background: #f0efeb; border-left: 3px solid #378ADD;
-    padding: 8px 10px; border-radius: 0 6px 6px 0; margin-bottom: 8px;
-    font-size: 0.82rem; line-height: 1.5; }
-  .badge { display: inline-block; font-size: 0.75rem; padding: 2px 8px;
-    border-radius: 20px; margin-left: 6px; font-weight: 500; }
-  .badge-en { background: #E6F1FB; color: #0C447C; }
-  .badge-hi { background: #EAF3DE; color: #27500A; }
-  .badge-gu { background: #FAEEDA; color: #633806; }
-</style>
-</head>
-<body>
-
-<h1>Suvit voice agent <span style="font-weight:400;color:#888">v2</span></h1>
-<p class="subtitle">
-  STT: Deepgram nova-3 &nbsp;·&nbsp;
-  TTS: Sarvam Bulbul v3 &nbsp;·&nbsp;
-  LLM: Gemini 2.5 Flash / GPT-4o-mini &nbsp;·&nbsp;
-  <a href="/docs" target="_blank">Swagger</a> &nbsp;·&nbsp;
-  <a href="/health" target="_blank">Health</a>
-</p>
-
-<div class="tabs">
-  <button class="tab active" onclick="switchTab('voice')">🎤 Voice (WS)</button>
-  <button class="tab" onclick="switchTab('v2v')">🔄 Voice-to-Voice (REST)</button>
-  <button class="tab" onclick="switchTab('text')">💬 Text only</button>
-  <button class="tab" onclick="switchTab('ask_voice')">🔊 Text to Voice</button>
-  <button class="tab" onclick="switchTab('rag')">📚 RAG test</button>
-  <button class="tab" onclick="switchTab('stt')">🎧 STT only</button>
-</div>
-
-<!-- VOICE WebSocket -->
-<div id="tab-voice" class="section active">
-  <div class="card">
-    <h2>Full streaming pipeline — WebSocket</h2>
-    <div class="mic-row">
-      <button id="mic-btn" class="primary"
-        onmousedown="startRec()" onmouseup="stopRec()"
-        ontouchstart="startRec()" ontouchend="stopRec()">🎤</button>
-      <span class="mic-status" id="mic-status">Hold to record</span>
-    </div>
-    <audio id="audio-out" controls style="display:none"></audio>
-    <div style="margin-top:12px">
-      <label>Log</label>
-      <div class="log" id="voice-log">Waiting...</div>
-    </div>
-  </div>
-</div>
-
-<!-- VOICE TO VOICE REST -->
-<div id="tab-v2v" class="section">
-  <div class="card">
-    <h2>Voice to voice — REST /voice_to_voice</h2>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
-      <button id="v2v-mic-btn" class="primary"
-        onmousedown="startV2VRec()" onmouseup="stopV2VRec()"
-        ontouchstart="startV2VRec()" ontouchend="stopV2VRec()">🎤</button>
-      <span id="v2v-mic-status">Hold to record</span>
-    </div>
-    <label>Or upload audio file</label>
-    <input type="file" id="v2v-file" accept="audio/*" style="margin-bottom:12px">
-    <button class="primary" onclick="testVoiceToVoice()">Send File</button>
-    <audio id="v2v-audio-out" controls style="display:none;margin-top:10px"></audio>
-    <div style="margin-top:12px"><div class="log" id="v2v-log">—</div></div>
-  </div>
-</div>
-
-<!-- TEXT -->
-<div id="tab-text" class="section">
-  <div class="card">
-    <h2>Text → answer</h2>
-    <label>Question</label>
-    <textarea id="text-q" placeholder="e.g. How do I upload a bank statement?"></textarea>
-    <label>Language</label>
-    <select id="text-lang">
-      <option value="en">English</option>
-      <option value="hi">Hindi</option>
-      <option value="gu">Gujarati</option>
-    </select>
-    <button class="primary" onclick="askText()">Send</button>
-    <div style="margin-top:12px"><div class="log" id="text-log">—</div></div>
-  </div>
-</div>
-
-<!-- TEXT TO VOICE -->
-<div id="tab-ask_voice" class="section">
-  <div class="card">
-    <h2>Text → voice answer</h2>
-    <label>Question</label>
-    <textarea id="voice-q" placeholder="e.g. How do I upload a bank statement?"></textarea>
-    <label>Language</label>
-    <select id="voice-lang">
-      <option value="en">English</option>
-      <option value="hi">Hindi</option>
-      <option value="gu">Gujarati</option>
-    </select>
-    <button class="primary" onclick="askVoice()">Speak</button>
-    <audio id="ask-voice-out" controls style="display:none;margin-top:10px"></audio>
-    <div style="margin-top:12px"><div class="log" id="voice-test-log">—</div></div>
-  </div>
-</div>
-
-<!-- RAG -->
-<div id="tab-rag" class="section">
-  <div class="card">
-    <h2>RAG retriever</h2>
-    <label>Query (English)</label>
-    <input type="text" id="rag-q" placeholder="e.g. bank statement failed status">
-    <label>Top-K</label>
-    <select id="rag-k"><option>3</option><option>5</option><option>2</option><option>1</option></select>
-    <button class="primary" onclick="testRag()">Retrieve</button>
-    <div style="margin-top:12px" id="rag-results"></div>
-  </div>
-</div>
-
-<!-- STT -->
-<div id="tab-stt" class="section">
-  <div class="card">
-    <h2>STT only — Deepgram nova-3</h2>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:15px">
-      <button id="stt-mic-btn" class="primary" onclick="toggleSTTRec()">🎤 Record from Mic</button>
-      <span id="stt-mic-status" style="font-size:0.85rem;color:#666">Ready</span>
-    </div>
-    <hr style="border:0;border-top:1px solid #eee;margin:15px 0">
-    <label>Or upload audio file (.webm / .mp3 / .wav)</label>
-    <input type="file" id="stt-file" accept="audio/*" style="margin-bottom:12px">
-    <button class="primary" onclick="testStt()">Transcribe File</button>
-    <div style="margin-top:12px"><div class="log" id="stt-log">—</div></div>
-  </div>
-</div>
-
-<script>
-// ── Tabs ──────────────────────────────────────────────────────
-const TAB_NAMES = ['voice','v2v','text','ask_voice','rag','stt'];
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', TAB_NAMES[i]===name));
-  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-  document.getElementById('tab-'+name).classList.add('active');
-}
-
-// ── WebSocket voice ───────────────────────────────────────────
-let ws=null, mediaRecorder=null;
-let audioQueue=[], sourceBuffer=null, mediaSource=null;
-
-function getWs() {
-  if (ws && ws.readyState===WebSocket.OPEN) return ws;
-  const proto = location.protocol==='https:' ? 'wss' : 'ws';
-  ws = new WebSocket(proto+'://'+location.host+'/ws/voice');
-  ws.onmessage = handleWsMsg;
-  ws.onerror   = () => voiceLog('WebSocket error — is the server running?');
-  return ws;
-}
-
-function handleWsMsg(e) {
-  const msg = JSON.parse(e.data);
-  if (msg.type==='status') {
-    voiceLog('⏳ '+msg.message);
-    document.getElementById('mic-status').textContent = msg.message;
-  } else if (msg.type==='transcript') {
-    const langBadge = `<span class="badge badge-${msg.language}">${msg.language.toUpperCase()}</span>`;
-    voiceLog('');
-    voiceLog('USER  '+msg.user);
-    voiceLog('LANG  '+msg.language+' → '+msg.english_query);
-    voiceLog('KB    '+msg.chunks_used+' chunks');
-  } else if (msg.type==='audio_start') {
-    document.getElementById('mic-status').textContent = 'Speaking...';
-  } else if (msg.type==='audio_chunk') {
-    const audio = document.getElementById('audio-out');
-    // The backend single-shot legacy mode sends full WAV audio in one chunk
-    audio.src = "data:audio/wav;base64," + msg.data;
-    audio.style.display = 'block';
-    audio.play();
-  } else if (msg.type==='audio_end') {
-    document.getElementById('mic-status').textContent = 'Hold to record';
-  } else if (msg.type==='error') {
-    voiceLog('ERROR '+msg.message);
-    document.getElementById('mic-status').textContent = 'Error — see log';
-  }
-}
-
-async function startRec() {
-  const w = getWs();
-  const go = async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
-    mediaRecorder = new MediaRecorder(stream, {mimeType:'audio/webm'});
-    const recordedChunks = [];
-    mediaRecorder.ondataavailable = async (e) => {
-      if (e.data.size>0) recordedChunks.push(e.data);
-    };
-    mediaRecorder.onstop = async () => {
-      if (ws && ws.readyState===WebSocket.OPEN) {
-        const blob = new Blob(recordedChunks, {type:'audio/webm'});
-        const buf = await blob.arrayBuffer();
-        const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-        // Send one complete WebM file per turn to avoid corrupt chunk joins.
-        ws.send(JSON.stringify({audio:b64, mime:(mediaRecorder.mimeType || 'audio/webm')}));
-      }
-      stream.getTracks().forEach(t=>t.stop());
-    };
-    mediaRecorder.start();
-    document.getElementById('mic-btn').textContent='⏹';
-    document.getElementById('mic-btn').classList.replace('primary','danger');
-    document.getElementById('mic-status').textContent='Recording...';
-  };
-  if (w.readyState===WebSocket.CONNECTING) w.addEventListener('open', go);
-  else go();
-}
-
-function stopRec() {
-  if (mediaRecorder && mediaRecorder.state==='recording') {
-    mediaRecorder.stop();
-    document.getElementById('mic-btn').textContent='🎤';
-    document.getElementById('mic-btn').classList.replace('danger','primary');
-    document.getElementById('mic-status').textContent='Processing...';
-  }
-}
-
-function voiceLog(msg) {
-  const el = document.getElementById('voice-log');
-  if (el.textContent==='Waiting...') el.textContent='';
-  el.textContent += (msg||'') + '\\n';
-  el.scrollTop = el.scrollHeight;
-}
-
-// ── V2V recorder ─────────────────────────────────────────────
-let v2vRecorder=null, v2vChunks=[];
-
-async function startV2VRec() {
-  const stream = await navigator.mediaDevices.getUserMedia({audio:true});
-  v2vRecorder = new MediaRecorder(stream, {mimeType:'audio/webm'});
-  v2vChunks=[];
-  v2vRecorder.ondataavailable = e => { if(e.data.size>0) v2vChunks.push(e.data); };
-  v2vRecorder.onstop = async () => {
-    const blob = new Blob(v2vChunks, {type:'audio/webm'});
-    document.getElementById('v2v-log').textContent='Processing...';
-    const form = new FormData();
-    form.append('file', blob, 'recorded.webm');
-    await submitV2V(form);
-    stream.getTracks().forEach(t=>t.stop());
-  };
-  v2vRecorder.start();
-  document.getElementById('v2v-mic-btn').textContent='⏹';
-  document.getElementById('v2v-mic-btn').classList.replace('primary','danger');
-  document.getElementById('v2v-mic-status').textContent='Recording...';
-}
-
-function stopV2VRec() {
-  if (v2vRecorder && v2vRecorder.state==='recording') {
-    v2vRecorder.stop();
-    document.getElementById('v2v-mic-btn').textContent='🎤';
-    document.getElementById('v2v-mic-btn').classList.replace('danger','primary');
-    document.getElementById('v2v-mic-status').textContent='Processing...';
-  }
-}
-
-async function testVoiceToVoice() {
-  const file = document.getElementById('v2v-file').files[0];
-  if (!file) return;
-  document.getElementById('v2v-log').textContent='Processing...';
-  const form = new FormData();
-  form.append('file', file);
-  await submitV2V(form);
-}
-
-async function submitV2V(form) {
-  try {
-    const res = await fetch('/voice_to_voice', {method:'POST', body:form});
-    if (!res.ok) throw new Error(await res.text());
-    const transcript = decodeURIComponent(res.headers.get('X-Transcript')||'');
-    const lang       = res.headers.get('X-Language')||'';
-    const blob       = await res.blob();
-    const audio      = document.getElementById('v2v-audio-out');
-    audio.src = URL.createObjectURL(blob);
-    audio.style.display='block';
-    audio.play();
-    document.getElementById('v2v-log').textContent =
-      'TRANSCRIPT: '+transcript+'\\nLANGUAGE:   '+lang+'\\nPlaying...';
-  } catch(e) {
-    document.getElementById('v2v-log').textContent='Error: '+e.message;
-  }
-}
-
-// ── Text /ask ─────────────────────────────────────────────────
-async function askText() {
-  const q    = document.getElementById('text-q').value.trim();
-  const lang = document.getElementById('text-lang').value;
-  if (!q) return;
-  document.getElementById('text-log').textContent='Calling /ask...';
-  try {
-    const res  = await fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:q, language:lang})});
-    const data = await res.json();
-    document.getElementById('text-log').textContent =
-      'ENGLISH QUERY: '+data.english_query+'\\n\\n'+
-      'CHUNKS: '+data.retrieved_chunks.length+'\\n'+
-      data.retrieved_chunks.map((c,i)=>`[${i+1}] ${c.slice(0,100)}...`).join('\\n')+
-      '\\n\\nANSWER:\\n'+data.answer;
-  } catch(e) { document.getElementById('text-log').textContent='Error: '+e.message; }
-}
-
-// ── Text to voice ─────────────────────────────────────────────
-async function askVoice() {
-  const q    = document.getElementById('voice-q').value.trim();
-  const lang = document.getElementById('voice-lang').value;
-  if (!q) return;
-  document.getElementById('voice-test-log').textContent='Generating...';
-  try {
-    const res = await fetch('/ask_voice', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:q, language:lang})});
-    if (!res.ok) throw new Error(await res.text());
-    const blob  = await res.blob();
-    const audio = document.getElementById('ask-voice-out');
-    audio.src = URL.createObjectURL(blob);
-    audio.style.display='block';
-    audio.play();
-    document.getElementById('voice-test-log').textContent='Playing...';
-  } catch(e) { document.getElementById('voice-test-log').textContent='Error: '+e.message; }
-}
-
-// ── RAG ───────────────────────────────────────────────────────
-async function testRag() {
-  const q = document.getElementById('rag-q').value.trim();
-  const k = document.getElementById('rag-k').value;
-  if (!q) return;
-  document.getElementById('rag-results').innerHTML='Retrieving...';
-  try {
-    const res  = await fetch('/retrieve?q='+encodeURIComponent(q)+'&k='+k);
-    const data = await res.json();
-    document.getElementById('rag-results').innerHTML =
-      data.chunks.map((c,i)=>`<div class="chunk"><strong>#${i+1}</strong><br>${c}</div>`).join('') || '<em>No results</em>';
-  } catch(e) { document.getElementById('rag-results').innerHTML='Error: '+e.message; }
-}
-
-// ── STT ───────────────────────────────────────────────────────
-let sttRecorder = null, sttChunks = [];
-async function toggleSTTRec() {
-  const btn = document.getElementById('stt-mic-btn');
-  const status = document.getElementById('stt-mic-status');
+# """
+# main.py — Suvit Voice Agent
+# ────────────────────────────
+# FastAPI server exposing:
+
+#   GET  /health              — liveness + dependency check
+#   GET  /test                — browser test console (HTML)
+#   POST /transcribe          — STT only (file upload)
+#   GET  /retrieve            — RAG retriever test (text query)
+#   POST /ask                 — text in → text out (no audio)
+#   POST /ask_voice           — text in → MP3 out
+#   POST /voice_to_voice      — audio file in → MP3 out
+#   WS   /ws/voice            — full streaming voice pipeline
+
+# Services:
+#   STT         : Deepgram nova-3  (language=multi → en/hi/gu)
+#   Translation : OpenAI GPT-4o-mini (primary) → Gemini 2.5 Flash (fallback)
+#   Generation  : Gemini 2.5 Flash (primary)   → OpenAI GPT-4o-mini (fallback)
+#   TTS         : Sarvam Bulbul v3 (primary)   → edge-tts (fallback)
+# """
+
+# import os
+# import json
+# import base64
+# import urllib.parse
+
+# from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Response
+# from fastapi.middleware.cors import CORSMiddleware
+# from fastapi.responses import HTMLResponse
+# from dotenv import load_dotenv
+
+# load_dotenv()
+
+# from agents.graph import agent_graph
+# from agents.state import VoiceState
+# from services.deepgram_stt import transcribe
+# from services.sarvam_tts import synthesize, synthesize_stream
+# from services.gemini_translate import (
+#     translate_to_english,
+#     generate_answer,
+# )
+# from services.realtime_voice import RealtimeVoiceSession
+# from services.voice_pipeline import run_voice_pipeline
+# from kb.retriever import retrieve
+# from livekit import api
+
+# app = FastAPI(title="Suvit Voice Agent", version="2.0.0")
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # ─── Health ──────────────────────────────────────────────────────────────────
+
+# @app.get("/health")
+# async def health():
+#     checks: dict = {}
+
+#     try:
+#         from kb.retriever import get_vectorstore
+#         get_vectorstore()
+#         checks["faiss_index"] = "ok"
+#     except Exception as e:
+#         checks["faiss_index"] = f"error: {e}"
+
+#     checks["deepgram_key"]  = "ok" if os.environ.get("DEEPGRAM_API_KEY")  else "missing"
+#     checks["openai_key"]    = "ok" if os.environ.get("OPENAI_API_KEY")    else "missing"
+#     checks["gemini_key"]    = "ok" if os.environ.get("GOOGLE_API_KEY")    else "missing"
+#     checks["sarvam_key"]    = "ok" if os.environ.get("SARVAMAI_API_KEY")  else "missing (edge-tts fallback active)"
+
+#     all_ok = all("error" not in v and "missing" not in v for v in checks.values()
+#                  if "fallback" not in v)
+#     return {"status": "ok" if all_ok else "degraded", "checks": checks}
+
+
+# # ─── LiveKit Token ──────────────────────────────────────────────────────────
+
+# @app.get("/api/token")
+# async def get_token(room: str, participant: str = "user"):
+#     """
+#     Generate an access token for a LiveKit room.
+#     Query params:
+#         room        : name of the room to join (required)
+#         participant : identity of the user (defaults to 'user')
+#     """
+#     token = (
+#         api.AccessToken(
+#             os.environ.get("LIVEKIT_API_KEY"),
+#             os.environ.get("LIVEKIT_API_SECRET")
+#         )
+#         .with_identity(participant)
+#         .with_grants(
+#             api.VideoGrants(
+#                 room_join=True,
+#                 room=room,
+#             )
+#         )
+#         .to_jwt()
+#     )
+#     return {"token": token}
+
+
+# # ─── STT test ────────────────────────────────────────────────────────────────
+
+# @app.post("/transcribe")
+# async def transcribe_audio(file: UploadFile = File(...)):
+#     """Upload any audio file → get transcript + detected language."""
+#     audio_bytes = await file.read()
+#     transcript, lang = await transcribe(audio_bytes)
+#     return {"transcript": transcript, "detected_language": lang}
+
+
+# # ─── RAG test ────────────────────────────────────────────────────────────────
+
+# @app.get("/retrieve")
+# async def retrieve_chunks(q: str, k: int = 3):
+#     """Test FAISS retriever with a plain English query."""
+#     chunks = retrieve(q, k=k)
+#     return {"query": q, "chunks": chunks}
+
+
+# # ─── Text → text ─────────────────────────────────────────────────────────────
+
+# @app.post("/ask")
+# async def ask_text(body: dict):
+#     """
+#     Full pipeline without audio.
+#     Body: { "question": "...", "language": "en" | "hi" | "gu" }
+#     """
+#     question = body.get("question", "")
+#     language = body.get("language", "en")
+
+#     english_q = await translate_to_english(question, language)
+#     chunks    = retrieve(english_q)
+#     answer    = await generate_answer(english_q, chunks, language)
+
+#     return {
+#         "question":         question,
+#         "language":         language,
+#         "english_query":    english_q,
+#         "retrieved_chunks": chunks,
+#         "answer":           answer,
+#     }
+
+
+# # ─── Text → voice ────────────────────────────────────────────────────────────
+
+# @app.post("/ask_voice")
+# async def ask_voice(body: dict):
+#     """
+#     Text question → MP3 audio response.
+#     Body: { "question": "...", "language": "en" | "hi" | "gu" }
+#     """
+#     question = body.get("question", "")
+#     language = body.get("language", "en")
+
+#     english_q   = await translate_to_english(question, language)
+#     chunks      = retrieve(english_q)
+#     answer      = await generate_answer(english_q, chunks, language)
+#     audio_bytes = await synthesize(answer, language)
+
+#     return Response(content=audio_bytes, media_type="audio/mpeg")
+
+
+# # ─── Voice file → voice ───────────────────────────────────────────────────────
+
+# @app.post("/voice_to_voice")
+# async def voice_to_voice(file: UploadFile = File(...)):
+#     """
+#     Upload audio → get back MP3 audio answer in the user's language.
+
+#     Response headers:
+#         X-Transcript : URL-encoded transcript
+#         X-Language   : detected language code (en / hi / gu)
+#     """
+#     audio_bytes = await file.read()
+
+#     try:
+#         result = await run_voice_pipeline(audio_bytes, k=5, mime_type=file.content_type)
+#     except Exception as e:
+#         print(f"[V2V] STT failed: {e}")
+#         # Fallback: return a spoken error message instead of crashing
+#         try:
+#             audio_out = await synthesize(
+#                 "Sorry, I couldn't process your audio. The speech service is temporarily unavailable. Please try again.", "en"
+#             )
+#             return Response(
+#                 content=audio_out,
+#                 media_type="audio/mpeg",
+#                 headers={
+#                     "X-Transcript": urllib.parse.quote("STT error"),
+#                     "X-Language":   "en",
+#                 },
+#             )
+#         except Exception:
+#             return Response(
+#                 content=b"",
+#                 media_type="audio/mpeg",
+#                 headers={"X-Transcript": "STT+TTS error", "X-Language": "en"},
+#             )
+
+#     print(
+#         f"[V2V] transcript='{result.transcript}' | lang={result.input_language} | "
+#         f"english_query='{result.english_query}' | chunks={len(result.retrieved_chunks)}"
+#     )
+
+#     return Response(
+#         content=result.audio_bytes,
+#         media_type="audio/mpeg",
+#         headers={
+#             "X-Transcript": urllib.parse.quote(result.transcript),
+#             "X-Language": result.input_language,
+#         },
+#     )
+
+
+# # ─── WebSocket: full streaming voice pipeline ─────────────────────────────────
+
+# @app.websocket("/ws/voice")
+# async def voice_endpoint(ws: WebSocket):
+#     """
+#     WebSocket voice pipeline with streaming TTS.
+
+#     Client message types (JSON):
+#         { "type": "audio_chunk", "audio": "<base64>" }  — send while recording
+#         { "type": "audio_end" }                          — signals end of recording
+
+#     Server message types (JSON):
+#         { "type": "status",      "message": "..." }
+#         { "type": "transcript",  "user": "...", "language": "...",
+#                                  "english_query": "...", "chunks_used": N }
+#         { "type": "audio_start" }
+#         { "type": "audio_chunk", "data": "<base64>" }    — streaming TTS audio
+#         { "type": "audio_end" }
+#         { "type": "error",       "message": "..." }
+#     """
+#     await ws.accept()
+#     session = RealtimeVoiceSession(ws)
+#     audio_chunks: list[bytes] = []
+
+#     try:
+#         await session.start()
+
+#         while True:
+#             message = await ws.receive()
+
+#             if message.get("bytes") is not None:
+#                 await session.process_audio_chunk(message["bytes"])
+#                 continue
+
+#             text_payload = message.get("text")
+#             if text_payload is None:
+#                 continue
+
+#             data = json.loads(text_payload)
+#             msg_type = data.get("type")
+
+#             if msg_type == "interrupt":
+#                 await session.interrupt()
+#                 continue
+
+#             if msg_type == "ping":
+#                 await ws.send_json({"type": "pong"})
+#                 continue
+
+#             # ── Accumulate audio chunks ──────────────────────────────────────
+#             if msg_type == "audio_chunk":
+#                 audio_chunks.append(base64.b64decode(data["audio"]))
+#                 continue
+
+#             # ── End of audio — run full pipeline ────────────────────────────
+#             if msg_type == "audio_end":
+#                 audio_bytes  = b"".join(audio_chunks)
+#                 audio_chunks = []
+
+#                 if not audio_bytes:
+#                     await ws.send_json({"type": "error", "message": "No audio received."})
+#                     continue
+
+#                 await ws.send_json({"type": "status", "message": "Transcribing..."})
+#                 await ws.send_json({"type": "status", "message": "Thinking..."})
+#                 try:
+#                     result = await run_voice_pipeline(audio_bytes, k=5)
+#                 except Exception as e:
+#                     await ws.send_json({"type": "error", "message": str(e)})
+#                     continue
+
+#                 await ws.send_json({
+#                     "type": "transcript",
+#                     "user": result.transcript,
+#                     "language": result.input_language,
+#                     "english_query": result.english_query,
+#                     "chunks_used": len(result.retrieved_chunks),
+#                 })
+
+#                 await ws.send_json({"type": "audio_start"})
+#                 audio_b64 = base64.b64encode(result.audio_bytes).decode()
+#                 await ws.send_json({"type": "audio_chunk", "data": audio_b64})
+#                 await ws.send_json({"type": "audio_end"})
+#                 continue
+
+#             # ── Legacy payload: { "audio": "<base64>" } (single-shot) ────────
+#             if "audio" in data and msg_type is None:
+#                 await ws.send_json({"type": "status", "message": "Transcribing..."})
+#                 await ws.send_json({"type": "status", "message": "Thinking..."})
+#                 audio_bytes = base64.b64decode(data["audio"])
+#                 mime_type = data.get("mime")
+#                 try:
+#                     result = await run_voice_pipeline(audio_bytes, k=5, mime_type=mime_type)
+#                 except Exception as e:
+#                     await ws.send_json({"type": "error", "message": str(e)})
+#                     continue
+
+#                 await ws.send_json({
+#                     "type": "transcript",
+#                     "user": result.transcript,
+#                     "language": result.input_language,
+#                     "english_query": result.english_query,
+#                     "chunks_used": len(result.retrieved_chunks),
+#                 })
+
+#                 await ws.send_json({"type": "audio_start"})
+#                 audio_b64 = base64.b64encode(result.audio_bytes).decode()
+#                 await ws.send_json({"type": "audio_chunk", "data": audio_b64})
+#                 await ws.send_json({"type": "audio_end"})
+
+#     except WebSocketDisconnect:
+#         await session.close()
+#     except Exception as e:
+#         import traceback
+#         traceback.print_exc()
+#         try:
+#             await ws.send_json({"type": "error", "message": str(e)})
+#         except Exception:
+#             pass
+#         await session.close()
+
+
+# # ─── Browser test page ────────────────────────────────────────────────────────
+
+# @app.get("/test", response_class=HTMLResponse)
+# async def test_page():
+#     return HTMLResponse(TEST_PAGE_HTML)
+
+
+# TEST_PAGE_HTML = """
+# <!DOCTYPE html>
+# <html lang="en">
+# <head>
+# <meta charset="UTF-8">
+# <title>Suvit Voice Agent — Test</title>
+# <style>
+#   * { box-sizing: border-box; margin: 0; padding: 0; }
+#   body { font-family: system-ui, sans-serif; background: #f5f5f0; color: #1a1a18; padding: 2rem; }
+#   h1 { font-size: 1.3rem; font-weight: 500; margin-bottom: 0.25rem; }
+#   .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 2rem; }
+
+#   .card { background: #fff; border: 0.5px solid #ddd; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
+#   .card h2 { font-size: 0.9rem; font-weight: 500; color: #444; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+#   label { font-size: 0.85rem; color: #555; display: block; margin-bottom: 4px; }
+#   input[type=text], textarea, select {
+#     width: 100%; padding: 8px 10px; border: 0.5px solid #ccc;
+#     border-radius: 8px; font-size: 0.9rem; font-family: inherit;
+#     background: #fafaf8; color: #1a1a18; margin-bottom: 12px;
+#   }
+#   textarea { min-height: 80px; resize: vertical; }
+#   button {
+#     padding: 8px 18px; border-radius: 8px; border: 0.5px solid #bbb;
+#     background: #fff; font-size: 0.875rem; cursor: pointer; font-family: inherit;
+#   }
+#   button:hover { background: #f0efeb; }
+#   button.primary { background: #378ADD; color: #fff; border-color: #185FA5; }
+#   button.primary:hover { background: #2e78cc; }
+#   button.danger { background: #D85A30; color: #fff; border-color: #993C1D; }
+
+#   #mic-btn { width: 72px; height: 72px; border-radius: 50%; font-size: 1.6rem; border: none; }
+#   .mic-row { display: flex; align-items: center; gap: 16px; margin-bottom: 1rem; }
+#   .mic-status { font-size: 0.85rem; color: #666; }
+
+#   .log { background: #f9f8f5; border: 0.5px solid #e0e0d8; border-radius: 8px;
+#     padding: 12px; font-family: monospace; font-size: 0.8rem; min-height: 80px;
+#     max-height: 260px; overflow-y: auto; white-space: pre-wrap; color: #333; }
+
+#   .tabs { display: flex; gap: 8px; margin-bottom: 1rem; flex-wrap: wrap; }
+#   .tab { padding: 6px 14px; border-radius: 8px; border: 0.5px solid #ccc;
+#     font-size: 0.85rem; cursor: pointer; background: #fff; }
+#   .tab.active { background: #1a1a18; color: #fff; border-color: #1a1a18; }
+
+#   .section { display: none; }
+#   .section.active { display: block; }
+#   audio { width: 100%; margin-top: 10px; }
+#   .chunk { background: #f0efeb; border-left: 3px solid #378ADD;
+#     padding: 8px 10px; border-radius: 0 6px 6px 0; margin-bottom: 8px;
+#     font-size: 0.82rem; line-height: 1.5; }
+#   .badge { display: inline-block; font-size: 0.75rem; padding: 2px 8px;
+#     border-radius: 20px; margin-left: 6px; font-weight: 500; }
+#   .badge-en { background: #E6F1FB; color: #0C447C; }
+#   .badge-hi { background: #EAF3DE; color: #27500A; }
+#   .badge-gu { background: #FAEEDA; color: #633806; }
+# </style>
+# </head>
+# <body>
+
+# <h1>Suvit voice agent <span style="font-weight:400;color:#888">v2</span></h1>
+# <p class="subtitle">
+#   STT: Deepgram nova-3 &nbsp;·&nbsp;
+#   TTS: Sarvam Bulbul v3 &nbsp;·&nbsp;
+#   LLM: Gemini 2.5 Flash / GPT-4o-mini &nbsp;·&nbsp;
+#   <a href="/docs" target="_blank">Swagger</a> &nbsp;·&nbsp;
+#   <a href="/health" target="_blank">Health</a>
+# </p>
+
+# <div class="tabs">
+#   <button class="tab active" onclick="switchTab('voice')">🎤 Voice (WS)</button>
+#   <button class="tab" onclick="switchTab('v2v')">🔄 Voice-to-Voice (REST)</button>
+#   <button class="tab" onclick="switchTab('text')">💬 Text only</button>
+#   <button class="tab" onclick="switchTab('ask_voice')">🔊 Text to Voice</button>
+#   <button class="tab" onclick="switchTab('rag')">📚 RAG test</button>
+#   <button class="tab" onclick="switchTab('stt')">🎧 STT only</button>
+# </div>
+
+# <!-- VOICE WebSocket -->
+# <div id="tab-voice" class="section active">
+#   <div class="card">
+#     <h2>Full streaming pipeline — WebSocket</h2>
+#     <div class="mic-row">
+#       <button id="mic-btn" class="primary"
+#         onmousedown="startRec()" onmouseup="stopRec()"
+#         ontouchstart="startRec()" ontouchend="stopRec()">🎤</button>
+#       <span class="mic-status" id="mic-status">Hold to record</span>
+#     </div>
+#     <audio id="audio-out" controls style="display:none"></audio>
+#     <div style="margin-top:12px">
+#       <label>Log</label>
+#       <div class="log" id="voice-log">Waiting...</div>
+#     </div>
+#   </div>
+# </div>
+
+# <!-- VOICE TO VOICE REST -->
+# <div id="tab-v2v" class="section">
+#   <div class="card">
+#     <h2>Voice to voice — REST /voice_to_voice</h2>
+#     <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
+#       <button id="v2v-mic-btn" class="primary"
+#         onmousedown="startV2VRec()" onmouseup="stopV2VRec()"
+#         ontouchstart="startV2VRec()" ontouchend="stopV2VRec()">🎤</button>
+#       <span id="v2v-mic-status">Hold to record</span>
+#     </div>
+#     <label>Or upload audio file</label>
+#     <input type="file" id="v2v-file" accept="audio/*" style="margin-bottom:12px">
+#     <button class="primary" onclick="testVoiceToVoice()">Send File</button>
+#     <audio id="v2v-audio-out" controls style="display:none;margin-top:10px"></audio>
+#     <div style="margin-top:12px"><div class="log" id="v2v-log">—</div></div>
+#   </div>
+# </div>
+
+# <!-- TEXT -->
+# <div id="tab-text" class="section">
+#   <div class="card">
+#     <h2>Text → answer</h2>
+#     <label>Question</label>
+#     <textarea id="text-q" placeholder="e.g. How do I upload a bank statement?"></textarea>
+#     <label>Language</label>
+#     <select id="text-lang">
+#       <option value="en">English</option>
+#       <option value="hi">Hindi</option>
+#       <option value="gu">Gujarati</option>
+#     </select>
+#     <button class="primary" onclick="askText()">Send</button>
+#     <div style="margin-top:12px"><div class="log" id="text-log">—</div></div>
+#   </div>
+# </div>
+
+# <!-- TEXT TO VOICE -->
+# <div id="tab-ask_voice" class="section">
+#   <div class="card">
+#     <h2>Text → voice answer</h2>
+#     <label>Question</label>
+#     <textarea id="voice-q" placeholder="e.g. How do I upload a bank statement?"></textarea>
+#     <label>Language</label>
+#     <select id="voice-lang">
+#       <option value="en">English</option>
+#       <option value="hi">Hindi</option>
+#       <option value="gu">Gujarati</option>
+#     </select>
+#     <button class="primary" onclick="askVoice()">Speak</button>
+#     <audio id="ask-voice-out" controls style="display:none;margin-top:10px"></audio>
+#     <div style="margin-top:12px"><div class="log" id="voice-test-log">—</div></div>
+#   </div>
+# </div>
+
+# <!-- RAG -->
+# <div id="tab-rag" class="section">
+#   <div class="card">
+#     <h2>RAG retriever</h2>
+#     <label>Query (English)</label>
+#     <input type="text" id="rag-q" placeholder="e.g. bank statement failed status">
+#     <label>Top-K</label>
+#     <select id="rag-k"><option>3</option><option>5</option><option>2</option><option>1</option></select>
+#     <button class="primary" onclick="testRag()">Retrieve</button>
+#     <div style="margin-top:12px" id="rag-results"></div>
+#   </div>
+# </div>
+
+# <!-- STT -->
+# <div id="tab-stt" class="section">
+#   <div class="card">
+#     <h2>STT only — Deepgram nova-3</h2>
+#     <div style="display:flex;gap:10px;align-items:center;margin-bottom:15px">
+#       <button id="stt-mic-btn" class="primary" onclick="toggleSTTRec()">🎤 Record from Mic</button>
+#       <span id="stt-mic-status" style="font-size:0.85rem;color:#666">Ready</span>
+#     </div>
+#     <hr style="border:0;border-top:1px solid #eee;margin:15px 0">
+#     <label>Or upload audio file (.webm / .mp3 / .wav)</label>
+#     <input type="file" id="stt-file" accept="audio/*" style="margin-bottom:12px">
+#     <button class="primary" onclick="testStt()">Transcribe File</button>
+#     <div style="margin-top:12px"><div class="log" id="stt-log">—</div></div>
+#   </div>
+# </div>
+
+# <script>
+# // ── Tabs ──────────────────────────────────────────────────────
+# const TAB_NAMES = ['voice','v2v','text','ask_voice','rag','stt'];
+# function switchTab(name) {
+#   document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', TAB_NAMES[i]===name));
+#   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+#   document.getElementById('tab-'+name).classList.add('active');
+# }
+
+# // ── WebSocket voice ───────────────────────────────────────────
+# let ws=null, mediaRecorder=null;
+# let audioQueue=[], sourceBuffer=null, mediaSource=null;
+
+# function getWs() {
+#   if (ws && ws.readyState===WebSocket.OPEN) return ws;
+#   const proto = location.protocol==='https:' ? 'wss' : 'ws';
+#   ws = new WebSocket(proto+'://'+location.host+'/ws/voice');
+#   ws.onmessage = handleWsMsg;
+#   ws.onerror   = () => voiceLog('WebSocket error — is the server running?');
+#   return ws;
+# }
+
+# function handleWsMsg(e) {
+#   const msg = JSON.parse(e.data);
+#   if (msg.type==='status') {
+#     voiceLog('⏳ '+msg.message);
+#     document.getElementById('mic-status').textContent = msg.message;
+#   } else if (msg.type==='transcript') {
+#     const langBadge = `<span class="badge badge-${msg.language}">${msg.language.toUpperCase()}</span>`;
+#     voiceLog('');
+#     voiceLog('USER  '+msg.user);
+#     voiceLog('LANG  '+msg.language+' → '+msg.english_query);
+#     voiceLog('KB    '+msg.chunks_used+' chunks');
+#   } else if (msg.type==='audio_start') {
+#     document.getElementById('mic-status').textContent = 'Speaking...';
+#   } else if (msg.type==='audio_chunk') {
+#     const audio = document.getElementById('audio-out');
+#     // The backend single-shot legacy mode sends full WAV audio in one chunk
+#     audio.src = "data:audio/wav;base64," + msg.data;
+#     audio.style.display = 'block';
+#     audio.play();
+#   } else if (msg.type==='audio_end') {
+#     document.getElementById('mic-status').textContent = 'Hold to record';
+#   } else if (msg.type==='error') {
+#     voiceLog('ERROR '+msg.message);
+#     document.getElementById('mic-status').textContent = 'Error — see log';
+#   }
+# }
+
+# async function startRec() {
+#   const w = getWs();
+#   const go = async () => {
+#     const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+#     mediaRecorder = new MediaRecorder(stream, {mimeType:'audio/webm'});
+#     const recordedChunks = [];
+#     mediaRecorder.ondataavailable = async (e) => {
+#       if (e.data.size>0) recordedChunks.push(e.data);
+#     };
+#     mediaRecorder.onstop = async () => {
+#       if (ws && ws.readyState===WebSocket.OPEN) {
+#         const blob = new Blob(recordedChunks, {type:'audio/webm'});
+#         const buf = await blob.arrayBuffer();
+#         const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+#         // Send one complete WebM file per turn to avoid corrupt chunk joins.
+#         ws.send(JSON.stringify({audio:b64, mime:(mediaRecorder.mimeType || 'audio/webm')}));
+#       }
+#       stream.getTracks().forEach(t=>t.stop());
+#     };
+#     mediaRecorder.start();
+#     document.getElementById('mic-btn').textContent='⏹';
+#     document.getElementById('mic-btn').classList.replace('primary','danger');
+#     document.getElementById('mic-status').textContent='Recording...';
+#   };
+#   if (w.readyState===WebSocket.CONNECTING) w.addEventListener('open', go);
+#   else go();
+# }
+
+# function stopRec() {
+#   if (mediaRecorder && mediaRecorder.state==='recording') {
+#     mediaRecorder.stop();
+#     document.getElementById('mic-btn').textContent='🎤';
+#     document.getElementById('mic-btn').classList.replace('danger','primary');
+#     document.getElementById('mic-status').textContent='Processing...';
+#   }
+# }
+
+# function voiceLog(msg) {
+#   const el = document.getElementById('voice-log');
+#   if (el.textContent==='Waiting...') el.textContent='';
+#   el.textContent += (msg||'') + '\\n';
+#   el.scrollTop = el.scrollHeight;
+# }
+
+# // ── V2V recorder ─────────────────────────────────────────────
+# let v2vRecorder=null, v2vChunks=[];
+
+# async function startV2VRec() {
+#   const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+#   v2vRecorder = new MediaRecorder(stream, {mimeType:'audio/webm'});
+#   v2vChunks=[];
+#   v2vRecorder.ondataavailable = e => { if(e.data.size>0) v2vChunks.push(e.data); };
+#   v2vRecorder.onstop = async () => {
+#     const blob = new Blob(v2vChunks, {type:'audio/webm'});
+#     document.getElementById('v2v-log').textContent='Processing...';
+#     const form = new FormData();
+#     form.append('file', blob, 'recorded.webm');
+#     await submitV2V(form);
+#     stream.getTracks().forEach(t=>t.stop());
+#   };
+#   v2vRecorder.start();
+#   document.getElementById('v2v-mic-btn').textContent='⏹';
+#   document.getElementById('v2v-mic-btn').classList.replace('primary','danger');
+#   document.getElementById('v2v-mic-status').textContent='Recording...';
+# }
+
+# function stopV2VRec() {
+#   if (v2vRecorder && v2vRecorder.state==='recording') {
+#     v2vRecorder.stop();
+#     document.getElementById('v2v-mic-btn').textContent='🎤';
+#     document.getElementById('v2v-mic-btn').classList.replace('danger','primary');
+#     document.getElementById('v2v-mic-status').textContent='Processing...';
+#   }
+# }
+
+# async function testVoiceToVoice() {
+#   const file = document.getElementById('v2v-file').files[0];
+#   if (!file) return;
+#   document.getElementById('v2v-log').textContent='Processing...';
+#   const form = new FormData();
+#   form.append('file', file);
+#   await submitV2V(form);
+# }
+
+# async function submitV2V(form) {
+#   try {
+#     const res = await fetch('/voice_to_voice', {method:'POST', body:form});
+#     if (!res.ok) throw new Error(await res.text());
+#     const transcript = decodeURIComponent(res.headers.get('X-Transcript')||'');
+#     const lang       = res.headers.get('X-Language')||'';
+#     const blob       = await res.blob();
+#     const audio      = document.getElementById('v2v-audio-out');
+#     audio.src = URL.createObjectURL(blob);
+#     audio.style.display='block';
+#     audio.play();
+#     document.getElementById('v2v-log').textContent =
+#       'TRANSCRIPT: '+transcript+'\\nLANGUAGE:   '+lang+'\\nPlaying...';
+#   } catch(e) {
+#     document.getElementById('v2v-log').textContent='Error: '+e.message;
+#   }
+# }
+
+# // ── Text /ask ─────────────────────────────────────────────────
+# async function askText() {
+#   const q    = document.getElementById('text-q').value.trim();
+#   const lang = document.getElementById('text-lang').value;
+#   if (!q) return;
+#   document.getElementById('text-log').textContent='Calling /ask...';
+#   try {
+#     const res  = await fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'},
+#       body:JSON.stringify({question:q, language:lang})});
+#     const data = await res.json();
+#     document.getElementById('text-log').textContent =
+#       'ENGLISH QUERY: '+data.english_query+'\\n\\n'+
+#       'CHUNKS: '+data.retrieved_chunks.length+'\\n'+
+#       data.retrieved_chunks.map((c,i)=>`[${i+1}] ${c.slice(0,100)}...`).join('\\n')+
+#       '\\n\\nANSWER:\\n'+data.answer;
+#   } catch(e) { document.getElementById('text-log').textContent='Error: '+e.message; }
+# }
+
+# // ── Text to voice ─────────────────────────────────────────────
+# async function askVoice() {
+#   const q    = document.getElementById('voice-q').value.trim();
+#   const lang = document.getElementById('voice-lang').value;
+#   if (!q) return;
+#   document.getElementById('voice-test-log').textContent='Generating...';
+#   try {
+#     const res = await fetch('/ask_voice', {method:'POST', headers:{'Content-Type':'application/json'},
+#       body:JSON.stringify({question:q, language:lang})});
+#     if (!res.ok) throw new Error(await res.text());
+#     const blob  = await res.blob();
+#     const audio = document.getElementById('ask-voice-out');
+#     audio.src = URL.createObjectURL(blob);
+#     audio.style.display='block';
+#     audio.play();
+#     document.getElementById('voice-test-log').textContent='Playing...';
+#   } catch(e) { document.getElementById('voice-test-log').textContent='Error: '+e.message; }
+# }
+
+# // ── RAG ───────────────────────────────────────────────────────
+# async function testRag() {
+#   const q = document.getElementById('rag-q').value.trim();
+#   const k = document.getElementById('rag-k').value;
+#   if (!q) return;
+#   document.getElementById('rag-results').innerHTML='Retrieving...';
+#   try {
+#     const res  = await fetch('/retrieve?q='+encodeURIComponent(q)+'&k='+k);
+#     const data = await res.json();
+#     document.getElementById('rag-results').innerHTML =
+#       data.chunks.map((c,i)=>`<div class="chunk"><strong>#${i+1}</strong><br>${c}</div>`).join('') || '<em>No results</em>';
+#   } catch(e) { document.getElementById('rag-results').innerHTML='Error: '+e.message; }
+# }
+
+# // ── STT ───────────────────────────────────────────────────────
+# let sttRecorder = null, sttChunks = [];
+# async function toggleSTTRec() {
+#   const btn = document.getElementById('stt-mic-btn');
+#   const status = document.getElementById('stt-mic-status');
   
-  if (sttRecorder && sttRecorder.state === 'recording') {
-    sttRecorder.stop();
-    btn.textContent = '🎤 Record from Mic';
-    btn.classList.replace('danger', 'primary');
-    status.textContent = 'Transcribing...';
-  } else {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      sttRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-      sttChunks = [];
-      sttRecorder.ondataavailable = e => { if (e.data.size > 0) sttChunks.push(e.data); };
-      sttRecorder.onstop = async () => {
-        const blob = new Blob(sttChunks, { type: 'audio/webm' });
-        const form = new FormData();
-        form.append('file', blob, 'recorded.webm');
-        document.getElementById('stt-log').textContent = 'Transcribing recorded audio...';
-        try {
-          const res = await fetch('/transcribe', { method: 'POST', body: form });
-          const data = await res.json();
-          document.getElementById('stt-log').textContent =
-            'TRANSCRIPT: ' + data.transcript + '\\nLANGUAGE:   ' + data.detected_language;
-          status.textContent = 'Ready';
-        } catch(e) {
-          document.getElementById('stt-log').textContent = 'Error: ' + e.message;
-          status.textContent = 'Error';
-        }
-        stream.getTracks().forEach(t => t.stop());
-      };
-      sttRecorder.start();
-      btn.textContent = '⏹ Stop Recording';
-      btn.classList.replace('primary', 'danger');
-      status.textContent = 'Recording...';
-    } catch(err) {
-      document.getElementById('stt-log').textContent = 'Error accessing microphone: ' + err.message;
-    }
-  }
-}
+#   if (sttRecorder && sttRecorder.state === 'recording') {
+#     sttRecorder.stop();
+#     btn.textContent = '🎤 Record from Mic';
+#     btn.classList.replace('danger', 'primary');
+#     status.textContent = 'Transcribing...';
+#   } else {
+#     try {
+#       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+#       sttRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+#       sttChunks = [];
+#       sttRecorder.ondataavailable = e => { if (e.data.size > 0) sttChunks.push(e.data); };
+#       sttRecorder.onstop = async () => {
+#         const blob = new Blob(sttChunks, { type: 'audio/webm' });
+#         const form = new FormData();
+#         form.append('file', blob, 'recorded.webm');
+#         document.getElementById('stt-log').textContent = 'Transcribing recorded audio...';
+#         try {
+#           const res = await fetch('/transcribe', { method: 'POST', body: form });
+#           const data = await res.json();
+#           document.getElementById('stt-log').textContent =
+#             'TRANSCRIPT: ' + data.transcript + '\\nLANGUAGE:   ' + data.detected_language;
+#           status.textContent = 'Ready';
+#         } catch(e) {
+#           document.getElementById('stt-log').textContent = 'Error: ' + e.message;
+#           status.textContent = 'Error';
+#         }
+#         stream.getTracks().forEach(t => t.stop());
+#       };
+#       sttRecorder.start();
+#       btn.textContent = '⏹ Stop Recording';
+#       btn.classList.replace('primary', 'danger');
+#       status.textContent = 'Recording...';
+#     } catch(err) {
+#       document.getElementById('stt-log').textContent = 'Error accessing microphone: ' + err.message;
+#     }
+#   }
+# }
 
-async function testStt() {
-  const file = document.getElementById('stt-file').files[0];
-  if (!file) return;
-  document.getElementById('stt-log').textContent='Transcribing...';
-  const form = new FormData();
-  form.append('file', file);
-  try {
-    const res  = await fetch('/transcribe', {method:'POST', body:form});
-    const data = await res.json();
-    document.getElementById('stt-log').textContent =
-      'TRANSCRIPT: '+data.transcript+'\\nLANGUAGE:   '+data.detected_language;
-  } catch(e) { document.getElementById('stt-log').textContent='Error: '+e.message; }
-}
-</script>
-</body>
-</html>
-"""
+# async function testStt() {
+#   const file = document.getElementById('stt-file').files[0];
+#   if (!file) return;
+#   document.getElementById('stt-log').textContent='Transcribing...';
+#   const form = new FormData();
+#   form.append('file', file);
+#   try {
+#     const res  = await fetch('/transcribe', {method:'POST', body:form});
+#     const data = await res.json();
+#     document.getElementById('stt-log').textContent =
+#       'TRANSCRIPT: '+data.transcript+'\\nLANGUAGE:   '+data.detected_language;
+#   } catch(e) { document.getElementById('stt-log').textContent='Error: '+e.message; }
+# }
+# </script>
+# </body>
+# </html>
+# """
 
 
 
@@ -3625,3 +3653,942 @@ async function testStt() {
 # </script>
 # </body>
 # </html>"""
+
+
+
+
+
+
+
+
+
+
+
+  
+
+"""
+main.py — Suvit Voice Agent  v5  (full-duplex phone-call, all bugs fixed)
+══════════════════════════════════════════════════════════════════════════
+  
+Bug fixes vs v4:
+  1. PCM buffering paused while agent is speaking — no more pipeline fires
+     on garbage audio captured during TTS playback.
+  2. Interrupt only sent once per speech burst, not per 4096-sample chunk.
+  3. VAD thresholds recalibrated for real microphone levels.
+  4. SILENCE_FRAMES computed correctly in terms of 48 kHz AudioContext frames
+     (128 samples each) not 16 kHz — was 5× too short before.
+  5. JS `addBubble` function renamed from `log` to avoid collision with
+     the HTML element id="log" and Math.log.
+  6. Agent-speaking guard moved into worklet message handler to prevent
+     race condition between tts_start JSON and next PCM binary frame.
+
+WebSocket protocol (unchanged):
+  CLIENT → SERVER:
+    binary frame              = raw Int16 LE PCM, 16 kHz, mono
+    JSON { type:"call_start",  language }
+    JSON { type:"vad_end" }   — client VAD silence detected
+    JSON { type:"interrupt" } — user spoke over agent
+    JSON { type:"call_end" }  — stop button
+  SERVER → CLIENT:
+    JSON { type:"call_accepted" }
+    JSON { type:"status",     message }
+    JSON { type:"transcript", user, language, english, chunks }
+    JSON { type:"tts_start" }
+    binary frame              = raw Int16 LE PCM, 22050 Hz, mono
+    JSON { type:"tts_end" }
+    JSON { type:"clear_queue" }
+    JSON { type:"call_ended", message }
+    JSON { type:"error",      message }
+"""
+
+import os, json, asyncio, logging, time
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("call")
+
+from agents.state import ConversationTurn
+from services.deepgram_stt import transcribe
+from services.sarvam_tts import synthesize_pcm_stream, synthesize
+from services.gemini_translate import (
+    translate_to_english, detect_language,
+    generate_answer, GREETINGS,
+)
+from kb.retriever import retrieve
+
+app = FastAPI(title="Suvit Voice Agent", version="5.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    checks = {}
+    try:
+        from kb.retriever import get_vectorstore; get_vectorstore()
+        checks["faiss_index"] = "ok"
+    except Exception as e:
+        checks["faiss_index"] = f"error: {e}"
+    checks["deepgram"] = "ok" if os.environ.get("DEEPGRAM_API_KEY") else "MISSING"
+    checks["openai"]   = "ok" if os.environ.get("OPENAI_API_KEY")   else "MISSING"
+    checks["gemini"]   = "ok" if os.environ.get("GOOGLE_API_KEY")   else "MISSING"
+    checks["sarvam"]   = ("ok" if os.environ.get("SARVAMAI_API_KEY")
+                          else "missing — edge-tts fallback active")
+    ok = all("MISSING" not in v and "error" not in v for v in checks.values())
+    return JSONResponse({"status": "ok" if ok else "degraded", "checks": checks})
+
+
+@app.post("/transcribe")
+async def transcribe_file(file: UploadFile = File(...)):
+    audio = await file.read()
+    t, lang = await transcribe(audio)
+    return {"transcript": t, "detected_language": lang}
+
+
+@app.get("/retrieve")
+async def retrieve_api(q: str, k: int = 3):
+    return {"query": q, "chunks": retrieve(q, k=k)}
+
+
+# ── WebSocket: full-duplex voice call ─────────────────────────────────────────
+
+@app.websocket("/ws/call")
+async def call_ws(ws: WebSocket):
+    await ws.accept()
+
+    history:        list[ConversationTurn] = []
+    current_lang:   str  = "en"
+    call_active:    bool = False
+    agent_speaking: bool = False   # True while server is streaming TTS
+
+    mic_buffer:  list[bytes]        = []   # PCM accumulated between vad_end events
+    tts_task:    asyncio.Task | None = None
+
+    # ── send helpers ──────────────────────────────────────────────────────────
+    async def send_json(obj: dict):
+        try:    await ws.send_json(obj)
+        except Exception: pass
+
+    async def send_bytes(data: bytes):
+        try:    await ws.send_bytes(data)
+        except Exception: pass
+
+    # ── TTS helpers ───────────────────────────────────────────────────────────
+    async def abort_tts():
+        nonlocal tts_task, agent_speaking
+        if tts_task and not tts_task.done():
+            tts_task.cancel()
+            try:    await tts_task
+            except asyncio.CancelledError: pass
+        agent_speaking = False
+        await send_json({"type": "clear_queue"})
+
+    async def _stream_tts(text: str, lang: str):
+        nonlocal agent_speaking
+        agent_speaking = True
+        await send_json({"type": "tts_start"})
+        try:
+            async for chunk in synthesize_pcm_stream(text, lang):
+                if tts_task and tts_task.cancelled():
+                    break
+                await send_bytes(chunk)
+                await asyncio.sleep(0)          # yield so interrupts can land
+            await send_json({"type": "tts_end"})
+        except asyncio.CancelledError:
+            await send_json({"type": "tts_end"})
+            raise
+        finally:
+            agent_speaking = False
+
+    async def speak(text: str, lang: str):
+        nonlocal tts_task
+        tts_task = asyncio.create_task(_stream_tts(text, lang))
+        try:    await tts_task
+        except asyncio.CancelledError: pass
+
+    # ── STT → translate → RAG → LLM → TTS ───────────────────────────────────
+    async def run_pipeline(audio_bytes: bytes):
+        t0       = time.perf_counter()
+        pcm_secs = len(audio_bytes) / (16_000 * 2)
+        log.info("━━━ PIPELINE  pcm=%.2fs  bytes=%d ━━━", pcm_secs, len(audio_bytes))
+
+        # 1. STT
+        await send_json({"type": "status", "message": "Transcribing…"})
+        t1 = time.perf_counter()
+        try:
+            transcript, lang_stt = await transcribe(audio_bytes)
+        except Exception as e:
+            log.error("[STT] FAILED: %s", e)
+            await send_json({"type": "error", "message": f"STT error: {e}"})
+            return
+
+        transcript = transcript.strip()
+        log.info("[STT]  %.2fs  lang=%s  %r", time.perf_counter()-t1, lang_stt, transcript[:80])
+
+        if not transcript:
+            log.warning("[STT]  empty transcript (silence or too quiet)")
+            await send_json({"type": "error",
+                             "message": "Didn't catch that — please speak clearly and try again."})
+            await send_json({"type": "status", "message": "Listening…"})
+            return
+
+        # 2. Language refinement
+        t2 = time.perf_counter()
+        try:
+            lang = await detect_language(transcript)
+        except Exception as e:
+            log.warning("[LANG] failed (%s) — using stt lang %s", e, lang_stt)
+            lang = lang_stt
+        nonlocal current_lang
+        current_lang = lang
+        log.info("[LANG]  %.2fs  %s → %s", time.perf_counter()-t2, lang_stt, lang)
+
+        # 3. Translate
+        await send_json({"type": "status", "message": "Thinking…"})
+        t3 = time.perf_counter()
+        english_q = await translate_to_english(transcript, lang)
+        log.info("[TRANSLATE]  %.2fs  %r → %r",
+                 time.perf_counter()-t3, transcript[:50], english_q[:50])
+
+        # 4. RAG
+        t4 = time.perf_counter()
+        chunks = retrieve(english_q)
+        log.info("[RAG]  %.2fs  %d chunks", time.perf_counter()-t4, len(chunks))
+
+        await send_json({"type": "transcript", "user": transcript,
+                         "language": lang, "english": english_q, "chunks": len(chunks)})
+
+        # 5. Generate
+        t5 = time.perf_counter()
+        answer = await generate_answer(
+            query_english=english_q,
+            context_chunks=chunks,
+            response_language=lang,
+            history=history,
+        )
+        log.info("[LLM]  %.2fs  %r", time.perf_counter()-t5, answer[:100])
+
+        # 6. History
+        history.append(ConversationTurn(role="user",      text=transcript, language=lang))
+        history.append(ConversationTurn(role="assistant", text=answer,     language=lang))
+        del history[:-10]
+
+        # 7. Speak
+        t6 = time.perf_counter()
+        log.info("[TTS]  synthesizing…")
+        await speak(answer, lang)
+        log.info("[TTS]  %.2fs", time.perf_counter()-t6)
+        log.info("━━━ DONE  total=%.2fs ━━━", time.perf_counter()-t0)
+
+        await send_json({"type": "status", "message": "Listening…"})
+
+    # ── message loop ──────────────────────────────────────────────────────────
+    try:
+        while True:
+            msg = await ws.receive()
+
+            # ── raw PCM binary frame from AudioWorklet ────────────────────
+            if "bytes" in msg and msg["bytes"]:
+                # BUG FIX 1: Only buffer when call is active AND agent is NOT speaking.
+                # Before: we buffered during TTS → vad_end fired on agent-audio echo → empty STT
+                if call_active and not agent_speaking:
+                    mic_buffer.append(msg["bytes"])
+                continue
+
+            # ── JSON control messages ─────────────────────────────────────
+            if "text" not in msg or not msg["text"]:
+                continue
+
+            data     = json.loads(msg["text"])
+            msg_type = data.get("type")
+
+            # ─────────────────────────────────────────────────────────────
+            if msg_type == "call_start":
+                current_lang  = data.get("language", "en")
+                call_active   = True
+                history       = []
+                mic_buffer    = []
+                log.info("━━━ CALL STARTED  lang=%s ━━━", current_lang)
+                await send_json({"type": "call_accepted"})
+                greeting = GREETINGS.get(current_lang, GREETINGS["en"])
+                log.info("[GREET]  %r", greeting)
+                history.append(ConversationTurn(
+                    role="assistant", text=greeting, language=current_lang))
+                await speak(greeting, current_lang)
+                mic_buffer = []   # discard anything captured during greeting
+                await send_json({"type": "status", "message": "Listening…"})
+
+            # ─────────────────────────────────────────────────────────────
+            elif msg_type == "vad_end":
+                # BUG FIX 2: Ignore vad_end while agent is speaking.
+                # The worklet fires vad_end based on its own audio analysis —
+                # it can't know the agent is speaking (it captures mic, not speakers).
+                if agent_speaking:
+                    log.debug("[VAD]  vad_end ignored — agent still speaking")
+                    mic_buffer = []
+                    continue
+
+                if not mic_buffer:
+                    log.debug("[VAD]  vad_end but mic_buffer empty — skipping")
+                    continue
+
+                audio_bytes = b"".join(mic_buffer)
+                mic_buffer  = []
+                log.info("[VAD]  vad_end  %.2fs audio", len(audio_bytes)/(16_000*2))
+                asyncio.create_task(run_pipeline(audio_bytes))
+
+            # ─────────────────────────────────────────────────────────────
+            elif msg_type == "interrupt":
+                log.info("[INTERRUPT]  user spoke — aborting TTS")
+                mic_buffer = []
+                await abort_tts()
+                await send_json({"type": "status", "message": "Listening…"})
+
+            # ─────────────────────────────────────────────────────────────
+            elif msg_type == "call_end":
+                log.info("━━━ CALL ENDED ━━━")
+                call_active = False
+                await abort_tts()
+                bye = {
+                    "en": "Goodbye! Have a great day.",
+                    "hi": "Theek hai! Dhanyavaad. Aapka din accha rahe.",
+                    "gu": "Saru che! Aabhaar. Tamaro divas saras rahe.",
+                }.get(current_lang, "Goodbye!")
+                log.info("[BYE]  %r", bye)
+                await speak(bye, current_lang)
+                await send_json({"type": "call_ended", "message": bye})
+                break
+
+    except WebSocketDisconnect:
+        log.info("[WS]  client disconnected")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        try:    await send_json({"type": "error", "message": str(e)})
+        except Exception: pass
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(CALL_UI)
+
+
+CALL_UI = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Suvit — Voice Support</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f0f;--surface:#1a1a1a;--border:#2e2e2e;
+  --text:#f0f0f0;--muted:#777;
+  --blue:#3b82f6;--red:#ef4444;--green:#22c55e;--amber:#f59e0b;
+  --user-bg:#1e3a5f;--agent-bg:#1a2e1a;
+}
+html,body{height:100%;font-family:system-ui,sans-serif;background:var(--bg);color:var(--text)}
+body{display:flex;align-items:center;justify-content:center;padding:1rem}
+
+.card{width:100%;max-width:440px;background:var(--surface);border:1px solid var(--border);
+  border-radius:24px;display:flex;flex-direction:column;overflow:hidden;
+  box-shadow:0 8px 48px rgba(0,0,0,.7)}
+
+/* header */
+.hdr{padding:1rem 1.4rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px}
+.av{width:42px;height:42px;border-radius:50%;background:var(--blue);display:flex;
+  align-items:center;justify-content:center;font-size:1.1rem;font-weight:600;flex-shrink:0}
+.hdr-info{flex:1}
+.hdr-name{font-size:.95rem;font-weight:500}
+.status-row{display:flex;align-items:center;gap:6px;margin-top:3px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--border);flex-shrink:0}
+.dot.listen{background:var(--green);animation:blink 1.8s ease-in-out infinite}
+.dot.think {background:var(--amber);animation:blink 1s   ease-in-out infinite}
+.dot.speak {background:var(--blue); animation:blink .8s  ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+.status-row span{font-size:.74rem;color:var(--muted)}
+
+/* lang */
+.lang-row{display:flex;gap:6px;padding:.65rem 1.4rem;border-bottom:1px solid var(--border)}
+.lb{padding:3px 14px;border-radius:20px;border:1px solid var(--border);
+  background:transparent;color:var(--muted);font-size:.78rem;cursor:pointer;transition:all .15s}
+.lb.on{background:var(--blue);color:#fff;border-color:var(--blue)}
+
+/* conversation */
+.conv{flex:1;min-height:280px;max-height:360px;overflow-y:auto;
+  padding:1rem 1.2rem;display:flex;flex-direction:column;gap:.55rem}
+.conv::-webkit-scrollbar{width:3px}
+.conv::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+
+.bbl{max-width:82%;padding:.5rem .9rem;border-radius:16px;
+  font-size:.86rem;line-height:1.6;animation:rise .18s ease}
+@keyframes rise{from{opacity:0;transform:translateY(5px)}}
+.bbl.user {align-self:flex-end;background:var(--user-bg);border-bottom-right-radius:4px}
+.bbl.agent{align-self:flex-start;background:var(--agent-bg);border-bottom-left-radius:4px}
+.bbl.sys  {align-self:center;font-size:.72rem;color:var(--muted);background:none;padding:2px 0}
+.ltag{font-size:.65rem;font-weight:600;padding:1px 5px;border-radius:8px;margin:0 3px;vertical-align:middle}
+.tag-en{background:#1e3a5f;color:#7cb9f8}
+.tag-hi{background:#1e2d1e;color:#86efac}
+.tag-gu{background:#2d2010;color:#fcd34d}
+
+.empty-state{flex:1;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:.5rem;color:var(--muted);font-size:.85rem;text-align:center}
+
+/* waveform */
+.viz{height:52px;padding:0 1.2rem;border-top:1px solid var(--border);display:flex;align-items:center}
+canvas{width:100%;height:38px}
+
+/* controls */
+.ctrls{padding:.85rem 1.4rem 1.1rem;border-top:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between}
+.vol{display:flex;align-items:center;gap:5px;font-size:.78rem;color:var(--muted)}
+input[type=range]{width:70px;accent-color:var(--blue)}
+.cbtn{width:64px;height:64px;border-radius:50%;border:none;cursor:pointer;
+  font-size:1.5rem;display:flex;align-items:center;justify-content:center;
+  background:var(--blue);color:#fff;transition:all .2s;
+  box-shadow:0 0 0 0 rgba(59,130,246,.5)}
+.cbtn.on{background:var(--red);box-shadow:0 0 0 0 rgba(239,68,68,.5)}
+.cbtn.pulse{animation:callpulse 1.5s ease-in-out infinite}
+@keyframes callpulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(59,130,246,.5)}
+  70%    {box-shadow:0 0 0 18px rgba(59,130,246,0)}}
+.cbtn.on.pulse{animation:callpulse-red 1.5s ease-in-out infinite}
+@keyframes callpulse-red{
+  0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.5)}
+  70%    {box-shadow:0 0 0 18px rgba(239,68,68,0)}}
+.meta{width:90px;font-size:.7rem;color:var(--muted);text-align:right;line-height:1.7}
+
+/* VAD indicator */
+.vad-bar{height:3px;background:var(--border);border-radius:2px;margin:0 1.2rem}
+.vad-fill{height:100%;width:0%;border-radius:2px;background:var(--green);transition:width .05s}
+</style>
+</head>
+<body>
+<div class="card">
+
+  <div class="hdr">
+    <div class="av">S</div>
+    <div class="hdr-info">
+      <div class="hdr-name">Suvit Support</div>
+      <div class="status-row">
+        <div class="dot" id="dot"></div>
+        <span id="stxt">Ready — press 📞 to start</span>
+      </div>
+    </div>
+    <a href="/health" target="_blank"
+       style="font-size:.7rem;color:var(--muted);text-decoration:none;opacity:.5">⚙</a>
+  </div>
+
+  <div class="lang-row">
+    <button class="lb on" data-l="en" onclick="pickLang('en')">English</button>
+    <button class="lb"    data-l="hi" onclick="pickLang('hi')">Hindi</button>
+    <button class="lb"    data-l="gu" onclick="pickLang('gu')">Gujarati</button>
+  </div>
+
+  <div class="conv" id="conv">
+    <div class="empty-state" id="empty">
+      <div style="font-size:2rem">📞</div>
+      <div>Press the call button to connect</div>
+      <div style="font-size:.72rem;opacity:.6;margin-top:.2rem">
+        English · Hindi · Gujarati
+      </div>
+    </div>
+  </div>
+
+  <!-- Thin bar showing mic energy (VAD level) -->
+  <div class="vad-bar"><div class="vad-fill" id="vad-fill"></div></div>
+
+  <div class="viz"><canvas id="cv" width="400" height="38"></canvas></div>
+
+  <div class="ctrls">
+    <div class="vol">
+      🔈
+      <input type="range" id="vol" min="0" max="2" step=".05" value="1"
+             oninput="if(gainNode) gainNode.gain.value=+this.value">
+      🔊
+    </div>
+    <button class="cbtn" id="cbtn" onclick="toggleCall()">📞</button>
+    <div class="meta" id="meta"></div>
+  </div>
+
+</div><!-- .card -->
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   AudioWorklet — runs on audio render thread (separate from main thread).
+
+   FIXES vs v4:
+     • SPEECH_THRESH raised to 0.015 (was 0.02 — too sensitive on some mics)
+     • SILENCE_FRAMES = 80 frames × 128 samples @ 48kHz = ~213ms per frame-group
+       → ~1700ms silence before vad_end. Previously 40 frames ≈ 107ms — too short.
+     • hasSpeech flag: worklet only sends pcm chunks AFTER speech has started,
+       not on every process() tick including background noise.
+     • speakingGuard: main thread posts {type:'agent_speaking', v:bool} to worklet
+       so the worklet itself can gate PCM output and VAD — eliminates race condition.
+   ════════════════════════════════════════════════════════════════════════════ */
+const WORKLET_SRC = `
+class MicProcessor extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this._tgtSR  = opts.processorOptions.targetSR || 16000;
+    this._ratio  = sampleRate / this._tgtSR;   // 48000/16000 = 3
+    this._pcmBuf = [];
+
+    // VAD thresholds (tuned for typical laptop/phone mics)
+    this._SPEECH_THRESH  = 0.015;   // RMS above this = speech
+    this._SILENCE_THRESH = 0.008;   // RMS below this = silence
+    this._SPEECH_FRAMES  = 5;       // consecutive loud frames before vad_start
+    this._SILENCE_FRAMES = 80;      // consecutive quiet frames before vad_end
+                                    // 80 × 128 samples / 48000 Hz ≈ 213 ms per group
+                                    // total silence ≈ 1.7 s
+
+    this._speechCnt  = 0;
+    this._silenceCnt = 0;
+    this._inSpeech   = false;
+    this._agentOn    = false;       // main thread tells us when agent speaks
+    this._energy     = 0;          // smoothed RMS for UI
+
+    this.port.onmessage = ({data}) => {
+      // Main thread → worklet: update agent-speaking state
+      if (data.type === 'agent_speaking') this._agentOn = data.v;
+    };
+  }
+
+  process(inputs) {
+    const ch = inputs[0]?.[0];
+    if (!ch || ch.length === 0) return true;
+
+    // Compute RMS energy
+    let sum = 0;
+    for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
+    const rms = Math.sqrt(sum / ch.length);
+
+    // Smooth energy for UI bar
+    this._energy = this._energy * 0.85 + rms * 0.15;
+    this.port.postMessage({ type: 'energy', v: this._energy });
+
+    // While agent is speaking: reset all VAD state, do NOT send PCM or vad_end.
+    // This is the key fix — the mic picks up speaker output, we must ignore it.
+    if (this._agentOn) {
+      this._speechCnt  = 0;
+      this._silenceCnt = 0;
+      this._inSpeech   = false;
+      this._pcmBuf     = [];
+      return true;
+    }
+
+    // ── VAD state machine ─────────────────────────────────────────────────
+    if (rms > this._SPEECH_THRESH) {
+      this._speechCnt++;
+      this._silenceCnt = 0;
+      if (this._speechCnt >= this._SPEECH_FRAMES && !this._inSpeech) {
+        this._inSpeech = true;
+        this.port.postMessage({ type: 'vad_start' });
+      }
+    } else if (rms < this._SILENCE_THRESH && this._inSpeech) {
+      this._silenceCnt++;
+      this._speechCnt = 0;
+      if (this._silenceCnt >= this._SILENCE_FRAMES) {
+        this._inSpeech   = false;
+        this._silenceCnt = 0;
+        this.port.postMessage({ type: 'vad_end' });
+      }
+    } else {
+      // in between thresholds — decay speech counter
+      if (this._speechCnt > 0) this._speechCnt--;
+    }
+
+    // ── Downsample Float32@48kHz → Int16@16kHz and emit ──────────────────
+    // Only accumulate if we are (or just were) in speech — avoids sending
+    // silence noise chunks that produce empty STT responses.
+    if (this._inSpeech || this._pcmBuf.length > 0) {
+      for (let i = 0; i < ch.length; i += this._ratio) {
+        this._pcmBuf.push(ch[Math.round(i)]);
+      }
+
+      while (this._pcmBuf.length >= 4096) {
+        const slice = this._pcmBuf.splice(0, 4096);
+        const i16   = new Int16Array(4096);
+        for (let i = 0; i < 4096; i++)
+          i16[i] = Math.max(-32768, Math.min(32767, slice[i] * 32767));
+        this.port.postMessage({ type: 'pcm', buf: i16.buffer }, [i16.buffer]);
+      }
+    }
+
+    return true;
+  }
+}
+registerProcessor('mic-proc', MicProcessor);
+`;
+
+/* ════════════════════════════════════════════════════════════════════════════
+   Main thread globals
+   ════════════════════════════════════════════════════════════════════════════ */
+let ws           = null;
+let callActive   = false;
+let agentSpeaking= false;
+let currentLang  = 'en';
+
+// Mic capture (48 kHz AudioContext + AudioWorklet)
+let micCtx       = null;
+let workletNode  = null;
+let micStream    = null;
+let analyserNode = null;
+
+// TTS playback (22050 Hz AudioContext, gapless scheduling)
+let playCtx      = null;
+let gainNode     = null;
+const TTS_SR     = 22050;
+let nextPlayAt   = 0;
+
+// Interrupt: only send once per burst, not per chunk
+let interruptSent = false;
+
+// Waveform RAF
+const cvEl = document.getElementById('cv');
+const cx   = cvEl.getContext('2d');
+let rafId  = null;
+
+/* ── Language picker ──────────────────────────────────────────────────────── */
+function pickLang(l) {
+  currentLang = l;
+  document.querySelectorAll('.lb')
+    .forEach(b => b.classList.toggle('on', b.dataset.l === l));
+}
+
+/* ── Status display ───────────────────────────────────────────────────────── */
+function setStatus(txt, mode) {
+  document.getElementById('stxt').textContent = txt;
+  const d = document.getElementById('dot');
+  d.className = 'dot' + (mode ? ' ' + mode : '');
+}
+
+/* ── Conversation bubbles ─────────────────────────────────────────────────── */
+// NOTE: function is named "addBubble" not "log" to avoid collision with
+// document.getElementById('log') and Math.log.
+function addBubble(role, text, lang) {
+  const el  = document.getElementById('conv');
+  const emp = document.getElementById('empty');
+  if (emp) emp.remove();
+
+  const d   = document.createElement('div');
+  d.className = 'bbl ' + role;
+  const tag = lang
+    ? `<span class="ltag tag-${lang}">${lang.toUpperCase()}</span>`
+    : '';
+  d.innerHTML = role === 'user'
+    ? tag + escHtml(text)
+    : escHtml(text) + tag;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+
+function sysMsg(text) {
+  const el = document.getElementById('conv');
+  const d  = document.createElement('div');
+  d.className = 'bbl sys';
+  d.textContent = text;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* ── TTS playback helpers ─────────────────────────────────────────────────── */
+function ensurePlayCtx() {
+  if (playCtx && playCtx.state !== 'closed') return;
+  playCtx    = new AudioContext({ sampleRate: TTS_SR });
+  gainNode   = playCtx.createGain();
+  gainNode.gain.value = +document.getElementById('vol').value;
+  gainNode.connect(playCtx.destination);
+  nextPlayAt = 0;
+}
+
+function scheduleChunk(arrayBuf) {
+  if (!playCtx || playCtx.state === 'closed') return;
+
+  const i16   = new Int16Array(arrayBuf);
+  const f32   = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+
+  const buf = playCtx.createBuffer(1, f32.length, TTS_SR);
+  buf.copyToChannel(f32, 0);
+
+  const src  = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(gainNode);
+
+  const now  = playCtx.currentTime;
+  const when = Math.max(now + 0.01, nextPlayAt);  // 10ms safety margin
+  src.start(when);
+  nextPlayAt = when + buf.duration;
+}
+
+function killPlayback() {
+  if (playCtx && playCtx.state !== 'closed') {
+    playCtx.close().catch(() => {});
+  }
+  playCtx       = null;
+  gainNode      = null;
+  nextPlayAt    = 0;
+  agentSpeaking = false;
+  setAgentSpeaking(false);
+}
+
+/* ── Sync agent-speaking state to worklet ─────────────────────────────────── */
+function setAgentSpeaking(v) {
+  agentSpeaking = v;
+  if (workletNode) {
+    workletNode.port.postMessage({ type: 'agent_speaking', v });
+  }
+  if (v) interruptSent = false;  // reset interrupt guard for new TTS burst
+}
+
+/* ── Waveform ─────────────────────────────────────────────────────────────── */
+function startWave() {
+  const data = new Uint8Array(analyserNode ? analyserNode.fftSize : 256);
+  function draw() {
+    rafId = requestAnimationFrame(draw);
+    if (analyserNode) analyserNode.getByteTimeDomainData(data);
+    cx.clearRect(0, 0, cvEl.width, cvEl.height);
+    cx.beginPath();
+    const sl = cvEl.width / data.length;
+    let x = 0;
+    for (let i = 0; i < data.length; i++) {
+      const y = ((data[i] / 128) - 1) * (cvEl.height / 2) + cvEl.height / 2;
+      i === 0 ? cx.moveTo(x, y) : cx.lineTo(x, y);
+      x += sl;
+    }
+    cx.strokeStyle = agentSpeaking ? '#3b82f6' : '#22c55e';
+    cx.lineWidth   = 1.5;
+    cx.stroke();
+  }
+  draw();
+}
+function stopWave() {
+  if (rafId) cancelAnimationFrame(rafId);
+  cx.clearRect(0, 0, cvEl.width, cvEl.height);
+}
+
+/* ── WebSocket ────────────────────────────────────────────────────────────── */
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/call`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'call_start', language: currentLang }));
+  };
+
+  ws.onmessage = e => {
+    // ── Binary frame = TTS PCM audio ──────────────────────────────────
+    if (e.data instanceof ArrayBuffer) {
+      if (!agentSpeaking) return;  // arrived after clear_queue, discard
+      ensurePlayCtx();
+      scheduleChunk(e.data);
+      return;
+    }
+
+    // ── JSON control ──────────────────────────────────────────────────
+    const msg = JSON.parse(e.data);
+
+    switch (msg.type) {
+      case 'call_accepted':
+        setStatus('Connected', 'listen');
+        break;
+
+      case 'status':
+        setStatus(msg.message,
+          msg.message.includes('Transcrib') || msg.message.includes('Think') ? 'think' : 'listen');
+        break;
+
+      case 'transcript':
+        addBubble('user', msg.user, msg.language);
+        document.getElementById('meta').textContent =
+          `${msg.chunks} chunks` + (msg.english !== msg.user
+            ? '\n→ ' + msg.english.slice(0, 38) + (msg.english.length > 38 ? '…' : '')
+            : '');
+        break;
+
+      case 'tts_start':
+        setAgentSpeaking(true);
+        ensurePlayCtx();
+        setStatus('Speaking…', 'speak');
+        break;
+
+      case 'tts_end':
+        setAgentSpeaking(false);
+        if (callActive) setStatus('Listening…', 'listen');
+        break;
+
+      case 'clear_queue':
+        killPlayback();
+        if (callActive) setStatus('Listening…', 'listen');
+        break;
+
+      case 'call_ended':
+        addBubble('agent', msg.message, currentLang);
+        endCall(false);
+        break;
+
+      case 'error':
+        sysMsg('⚠ ' + msg.message);
+        if (callActive) setStatus('Listening…', 'listen');
+        break;
+    }
+  };
+
+  ws.onerror = () => sysMsg('WebSocket connection error — is the server running?');
+  ws.onclose = () => { if (callActive) endCall(false); };
+}
+
+/* ── Microphone + AudioWorklet ────────────────────────────────────────────── */
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl:  true,
+      sampleRate:       48000,
+    }
+  });
+
+  micCtx = new AudioContext({ sampleRate: 48000 });
+
+  // Inject worklet via Blob URL — no static file needed
+  const blob    = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+  const blobURL = URL.createObjectURL(blob);
+  await micCtx.audioWorklet.addModule(blobURL);
+  URL.revokeObjectURL(blobURL);
+
+  const srcNode = micCtx.createMediaStreamSource(micStream);
+
+  analyserNode = micCtx.createAnalyser();
+  analyserNode.fftSize = 256;
+  srcNode.connect(analyserNode);
+
+  workletNode = new AudioWorkletNode(micCtx, 'mic-proc', {
+    processorOptions: { targetSR: 16000 },
+    channelCount:            1,
+    channelCountMode:        'explicit',
+    channelInterpretation:   'discrete',
+  });
+  srcNode.connect(workletNode);
+
+  workletNode.port.onmessage = ({ data }) => {
+    if (!callActive) return;
+
+    if (data.type === 'energy') {
+      // Update thin VAD-level bar at the top of waveform
+      const pct = Math.min(100, data.v * 1200);
+      document.getElementById('vad-fill').style.width = pct + '%';
+      return;
+    }
+
+    if (data.type === 'pcm') {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(data.buf);   // zero-copy binary frame
+
+        // BUG FIX: Interrupt only fires once per agent-speaking burst.
+        // Previously fired on every 4096-sample chunk = floods the server.
+        if (agentSpeaking && !interruptSent) {
+          interruptSent = true;
+          ws.send(JSON.stringify({ type: 'interrupt' }));
+          killPlayback();
+          setStatus('Listening…', 'listen');
+        }
+      }
+      return;
+    }
+
+    if (data.type === 'vad_end') {
+      if (ws && ws.readyState === WebSocket.OPEN && !agentSpeaking) {
+        ws.send(JSON.stringify({ type: 'vad_end' }));
+        setStatus('Processing…', 'think');
+      }
+      return;
+    }
+
+    if (data.type === 'vad_start') {
+      if (!agentSpeaking) setStatus('Listening…', 'listen');
+      return;
+    }
+  };
+
+  startWave();
+}
+
+function stopMic() {
+  if (workletNode)  { workletNode.disconnect(); workletNode  = null; }
+  if (micCtx)       { micCtx.close().catch(() => {}); micCtx = null; }
+  if (micStream)    { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  analyserNode = null;
+  stopWave();
+  document.getElementById('vad-fill').style.width = '0%';
+}
+
+/* ── Call control ─────────────────────────────────────────────────────────── */
+async function toggleCall() {
+  if (!callActive) await startCall();
+  else             endCall(true);
+}
+
+async function startCall() {
+  callActive = true;
+
+  const btn = document.getElementById('cbtn');
+  btn.textContent = '📵';
+  btn.classList.add('on', 'pulse');
+
+  // Clear conversation log
+  const conv = document.getElementById('conv');
+  conv.innerHTML = '';
+
+  setStatus('Connecting…', '');
+  connectWS();
+
+  try {
+    await startMic();
+  } catch (err) {
+    sysMsg('⚠ Microphone access denied: ' + err.message);
+    endCall(true);
+  }
+}
+
+function endCall(sendMsg) {
+  callActive    = false;
+  interruptSent = false;
+  setAgentSpeaking(false);
+
+  if (sendMsg && ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({ type: 'call_end' }));
+  else if (ws)
+    ws.close();
+
+  stopMic();
+  killPlayback();
+
+  const btn = document.getElementById('cbtn');
+  btn.textContent = '📞';
+  btn.classList.remove('on', 'pulse');
+
+  setStatus('Call ended', '');
+  document.getElementById('meta').textContent = '';
+  setTimeout(() => setStatus('Ready — press 📞 to start', ''), 2500);
+}
+</script>
+</body>
+</html>"""

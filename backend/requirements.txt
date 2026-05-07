@@ -16,3 +16,8 @@ edge-tts
 numpy>=1.26.0     # already a transitive dep, now explicit
 scipy>=1.13.0     # polyphase resampling
 pydub>=0.25.1     # MP3→PCM decode for edge-tts fallback
+livekit
+livekit-agents
+livekit-plugins-openai
+livekit-plugins-deepgram
+livekit-plugins-silero
