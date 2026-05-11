@@ -1,49 +1,64 @@
 # Suvit AI Voice Agent
 
-A premium, hyper-responsive full-duplex voice assistant engineered for zero-latency support interactions. Featuring cloud-based neural VAD, instant hardware interruptions, dynamic multilingual synthesis, and fully localized knowledge base retrieval.
 
-## ✨ Key Capabilities
+## Features
 
-- **Continuous Streaming Architecture**: Utilizes full-duplex WebSocket streaming powered by Deepgram for sub-second interactivity
-- **Instant Neural Interruptions**: Agent stops speaking *immediately* when you speak, guaranteed via server-side cloud activity detection.
-- **Background-Safe Runtime**: Utilizes dedicated CPU thread shielding preventing heavy knowledge lookups from freezing active stream heartbeats.
-- **Hardware Mute Override**: Integrates browser-level track lifecycle handlers delivering absolute 0% audio leakage when muted.
-- **Localized RAG Vectorstore**: High-speed similarity lookups leveraging optimized FAISS embeddings for accurate information retrieval.
+- Full-Duplex Audio: Real-time WebSocket streaming powered by Deepgram.
+- Instant Interruptions: Agent stops speaking immediately upon voice activity detection.
+- Hardware Mute: Integrated browser-level microphone controls for 100% privacy.
+- Knowledge Base RAG: Fast context retrieval utilizing FAISS vector storage.
 
 ---
 
-## 🚀 Quick Start Guide
+## Setup Sequence
 
-### 1. Launch the Backend
+Follow these exact steps in order to successfully build and launch the application.
 
-Navigate into the backend layer, configure environment keys, and initiate server.
+### 1. Configuration
+
+Create a file named `.env` inside the `backend/` directory and insert your API keys:
+
+```env
+DEEPGRAM_API_KEY="your_key_here"
+GEMINI_API_KEY="your_key_here"
+OPENAI_API_KEY="your_key_here"
+SARVAMAI_API_KEY="your_key_here"
+```
+
+### 2. Environment Preparation
+
+Navigate to the backend folder, generate your virtual python environment, and install runtime dependencies.
 
 ```bash
 cd backend
 python -m venv venv
-source venv/bin/activate  # Windows: .\venv\Scripts\activate
-pip install -r requirements.txt # Or install necessary packages
-uvicorn main:app --reload --port 8000
+.\venv\Scripts\activate  # On Windows
+# source venv/bin/activate # On Linux/macOS
+pip install -r requirements.txt
 ```
 
-### 2. Knowledge Base Setup (Data Ingestion)
+### 3. Database Ingestion
 
-Initialize the local RAG database with your custom domain knowledge.
+You must execute the ingestion builder before starting the application server so the localized search indices are generated.
 
 ```bash
-# 1. Place your source data (.md files) here:
-# backend/kb/docs/
-
-# 2. Run the ingestion pipeline to generate the FAISS index:
-cd backend
+# Ensure source documents exist in backend/kb/docs/
 python kb/ingest.py
 ```
 
-*Log confirmations: `Building FAISS index... Done. Index saved to .../index/`*
+Verification: You should see logs confirming "Building FAISS index... Done." and an "index" folder generated.
 
-### 3. Launch the Dashboard
+### 4. Launch Backend
 
-Boot the dynamic React dashboard using Vite.
+With the indices built, you can now safely start the API server.
+
+```bash
+uvicorn main:app --reload --port 8000
+```
+
+### 5. Launch Frontend
+
+Open a new terminal window, navigate into the frontend folder, and boot the user interface.
 
 ```bash
 cd frontend
@@ -53,28 +68,10 @@ npm run dev
 
 ---
 
-## 🛠 Technical Ecosystem
+## Technical Stack
 
-| Component                   | Solution                                   |
-| :-------------------------- | :----------------------------------------- |
-| **Core Framework**    | FastAPI (Python) & React (TypeScript)      |
-| **Real-Time STT**     | Deepgram Nova-3 Neural WebSocket           |
-| **LLM Intelligence**  | Google Gemini 2.5 Flash                    |
-| **Translation Logic** | OpenAI Whisper & ChatGPT-4                 |
-| **Speech Synthesis**  | Sarvam.ai Neural TTS (Indic Support)       |
-| **Knowledge Engine**  | LangChain + HuggingFace Embeddings + FAISS |
-
-## ⚙️ Environment Variables
-
-Required variables in `backend/.env`:
-
-```env
-DEEPGRAM_API_KEY="your-key"
-GOOGLE_API_KEY="your-key"
-OPENAI_API_KEY="your-key"
-SARVAMAI_API_KEY="your-key"
-```
-
-## 🔒 Privacy & Security
-
-Microphone access is requested solely at the runtime start event and is released instantly upon call termination. Explicit "Mute" commands utilize `MediaStreamTrack.enabled = false` executing absolute hardware silent gating at the edge device level before propagation.
+- Core: FastAPI (Python 3.13) & React (Vite)
+- STT: Deepgram Nova-3 WebSocket
+- LLM Intelligence: Google Gemini
+- Speech Synthesis: Sarvam.ai Neural TTS
+- Vector Storage: FAISS + HuggingFace Embeddings
