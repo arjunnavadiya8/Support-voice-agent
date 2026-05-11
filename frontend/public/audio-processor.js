@@ -1,39 +1,50 @@
-class PCMProcessor extends AudioWorkletProcessor {
-    constructor() {
-        super();
-        this.bufferSize = 4096; // 4096 samples per chunk
-        this._bytesWritten = 0;
-        this._buffer = new Float32Array(this.bufferSize);
+class MicProcessor extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this._tgtSR  = opts.processorOptions?.targetSR || 16000;
+    this._ratio  = sampleRate / this._tgtSR;   
+    this._pcmBuf = [];
+    
+    this._energy  = 0; // Still keep energy visualization for the UI bar
+    this._agentOn = false;
+
+    this.port.onmessage = ({data}) => {
+      if (data.type === 'agent_speaking') this._agentOn = data.v;
+    };
+  }
+
+  process(inputs) {
+    const ch = inputs[0]?.[0];
+    if (!ch || ch.length === 0) return true;
+
+    // 1. Compute energy strictly for UI visualization bar, NOT for gating
+    let sum = 0;
+    for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
+    const rms = Math.sqrt(sum / ch.length);
+    this._energy = this._energy * 0.85 + rms * 0.15;
+    this.port.postMessage({ type: 'energy', v: this._energy });
+
+    // 2. Continuous Streaming Pipeline
+    // We pipe EVERYTHING to Deepgram Neural Cloud continuously to allow
+    // true server-side barge-in. The local OS echo cancellation handle filters loopback.
+
+    // Downsample Float32@48kHz → Int16@16kHz directly
+    for (let i = 0; i < ch.length; i += this._ratio) {
+      const idx = Math.round(i);
+      if(idx < ch.length) this._pcmBuf.push(ch[idx]);
     }
 
-    process(inputs, outputs, parameters) {
-        const input = inputs[0];
-        if (input.length > 0) {
-            const channelData = input[0];
-            for (let i = 0; i < channelData.length; i++) {
-                this._buffer[this._bytesWritten++] = channelData[i];
-                if (this._bytesWritten >= this.bufferSize) {
-                    this.flush();
-                }
-            }
-        }
-        return true;
+    // Emit when buffer fills 4096 samples
+    while (this._pcmBuf.length >= 4096) {
+      const slice = this._pcmBuf.splice(0, 4096);
+      const i16   = new Int16Array(4096);
+      for (let i = 0; i < 4096; i++)
+        i16[i] = Math.max(-32768, Math.min(32767, slice[i] * 32767));
+      this.port.postMessage({ type: 'pcm', buf: i16.buffer }, [i16.buffer]);
     }
 
-    flush() {
-        // We have 4096 Float32 samples.
-        // Convert Float32 to Int16
-        const int16Buffer = new Int16Array(this.bufferSize);
-        for (let i = 0; i < this.bufferSize; i++) {
-            let s = Math.max(-1, Math.min(1, this._buffer[i]));
-            int16Buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-
-        // Send back to main thread
-        this.port.postMessage(int16Buffer.buffer, [int16Buffer.buffer]);
-        this._bytesWritten = 0;
-        this._buffer = new Float32Array(this.bufferSize);
-    }
+    return true;
+  }
 }
 
-registerProcessor("pcm-processor", PCMProcessor);
+registerProcessor('pcm-processor', MicProcessor);

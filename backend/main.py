@@ -3717,7 +3717,7 @@ logging.basicConfig(
 log = logging.getLogger("call")
 
 from agents.state import ConversationTurn
-from services.deepgram_stt import transcribe
+from services.deepgram_stt import transcribe, DeepgramStreamingSTT
 from services.sarvam_tts import synthesize_pcm_stream, synthesize
 from services.gemini_translate import (
     translate_to_english, detect_language,
@@ -3727,6 +3727,23 @@ from kb.retriever import retrieve
 
 app = FastAPI(title="Suvit Voice Agent", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+async def startup_event():
+    async def _bg_load_kb():
+        log.info("[BOOT] Loading Knowledge Base in background task...")
+        try:
+            from kb.retriever import get_vectorstore
+            # Perform expensive I/O/Model loading in dedicated background thread
+            await asyncio.to_thread(get_vectorstore)
+            log.info("[BOOT] Knowledge Base Load Complete.")
+        except Exception as e:
+            log.error("[BOOT] FAILED to load KB: %s", e)
+
+    # Fire and forget immediately without blocking FastAPIs fast startup
+    asyncio.create_task(_bg_load_kb())
+
+
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -3771,8 +3788,9 @@ async def call_ws(ws: WebSocket):
     call_active:    bool = False
     agent_speaking: bool = False   # True while server is streaming TTS
 
-    mic_buffer:  list[bytes]        = []   # PCM accumulated between vad_end events
     tts_task:    asyncio.Task | None = None
+    pipeline_task: asyncio.Task | None = None
+    dg_stt:      DeepgramStreamingSTT | None = None
 
     # ── send helpers ──────────────────────────────────────────────────────────
     async def send_json(obj: dict):
@@ -3783,13 +3801,22 @@ async def call_ws(ws: WebSocket):
         try:    await ws.send_bytes(data)
         except Exception: pass
 
-    # ── TTS helpers ───────────────────────────────────────────────────────────
-    async def abort_tts():
-        nonlocal tts_task, agent_speaking
+    # ── Task Cancellation helpers ─────────────────────────────────────────────
+    async def abort_pipeline():
+        nonlocal tts_task, pipeline_task, agent_speaking
+        
+        # 1. Kill active LLM/RAG generation
+        if pipeline_task and not pipeline_task.done():
+            pipeline_task.cancel()
+            try:    await pipeline_task
+            except asyncio.CancelledError: pass
+            
+        # 2. Kill active voice stream
         if tts_task and not tts_task.done():
             tts_task.cancel()
             try:    await tts_task
             except asyncio.CancelledError: pass
+            
         agent_speaking = False
         await send_json({"type": "clear_queue"})
 
@@ -3817,29 +3844,37 @@ async def call_ws(ws: WebSocket):
         except asyncio.CancelledError: pass
 
     # ── STT → translate → RAG → LLM → TTS ───────────────────────────────────
-    async def run_pipeline(audio_bytes: bytes):
+    async def run_pipeline(audio_bytes: bytes | None = None, text_input: str | None = None):
         t0       = time.perf_counter()
-        pcm_secs = len(audio_bytes) / (16_000 * 2)
-        log.info("━━━ PIPELINE  pcm=%.2fs  bytes=%d ━━━", pcm_secs, len(audio_bytes))
+        if audio_bytes:
+            pcm_secs = len(audio_bytes) / (16_000 * 2)
+            log.info("━━━ PIPELINE AUDIO  pcm=%.2fs  bytes=%d ━━━", pcm_secs, len(audio_bytes))
+        else:
+            log.info("━━━ PIPELINE TEXT   %r ━━━", text_input[:50] if text_input else "")
 
-        # 1. STT
-        await send_json({"type": "status", "message": "Transcribing…"})
-        t1 = time.perf_counter()
-        try:
-            transcript, lang_stt = await transcribe(audio_bytes)
-        except Exception as e:
-            log.error("[STT] FAILED: %s", e)
-            await send_json({"type": "error", "message": f"STT error: {e}"})
+        # 1. Input Acquisition (STT or Text)
+        transcript = ""
+        lang_stt = "en"
+
+        if audio_bytes:
+            await send_json({"type": "status", "message": "Transcribing…"})
+            t1 = time.perf_counter()
+            try:
+                transcript, lang_stt = await transcribe(audio_bytes)
+            except Exception as e:
+                log.error("[STT] FAILED: %s", e)
+                await send_json({"type": "error", "message": f"STT error: {e}"})
+                return
+            transcript = transcript.strip()
+            log.info("[STT]  %.2fs  lang=%s  %r", time.perf_counter()-t1, lang_stt, transcript[:80])
+        elif text_input:
+            transcript = text_input.strip()
+            # Deepgram stream already provided text_input, skip STT
+        else:
             return
 
-        transcript = transcript.strip()
-        log.info("[STT]  %.2fs  lang=%s  %r", time.perf_counter()-t1, lang_stt, transcript[:80])
-
         if not transcript:
-            log.warning("[STT]  empty transcript (silence or too quiet)")
-            await send_json({"type": "error",
-                             "message": "Didn't catch that — please speak clearly and try again."})
-            await send_json({"type": "status", "message": "Listening…"})
+            # Skip empty strings emitted by background noise
             return
 
         # 2. Language refinement
@@ -3883,6 +3918,9 @@ async def call_ws(ws: WebSocket):
         history.append(ConversationTurn(role="assistant", text=answer,     language=lang))
         del history[:-10]
 
+        # Send assistant text response explicitly to client (so frontend can render bubble)
+        await send_json({"type": "assistant_end", "text": answer, "language": lang})
+
         # 7. Speak
         t6 = time.perf_counter()
         log.info("[TTS]  synthesizing…")
@@ -3890,7 +3928,32 @@ async def call_ws(ws: WebSocket):
         log.info("[TTS]  %.2fs", time.perf_counter()-t6)
         log.info("━━━ DONE  total=%.2fs ━━━", time.perf_counter()-t0)
 
+    # ── Deepgram Stream Handlers ──────────────────────────────────────────────
+    async def dg_on_speech_started():
+        log.info("[CALLBACK] Cloud VAD detects user speech -> Halting agent")
+        await abort_pipeline()
+        # Also notify client UI to switch state immediately
         await send_json({"type": "status", "message": "Listening…"})
+
+    async def dg_on_final(text: str, lang: str):
+        if not text.strip(): return
+        log.info("[CALLBACK] Sentence finalized: %r", text)
+        
+        # Immediately execute the AI analysis logic using the finalized string
+        nonlocal pipeline_task
+        await abort_pipeline()
+        pipeline_task = asyncio.create_task(run_pipeline(text_input=text))
+
+    async def dg_on_interim(text: str, lang: str):
+        # Forward streaming text to frontend immediately for "live typing" UI
+        await send_json({"type": "transcript_update", "text": text, "language": lang})
+
+    # Initialize and bind the persistent stream engine
+    dg_stt = DeepgramStreamingSTT(
+        on_speech_started = dg_on_speech_started,
+        on_final          = dg_on_final,
+        on_interim        = dg_on_interim
+    )
 
     # ── message loop ──────────────────────────────────────────────────────────
     try:
@@ -3899,10 +3962,9 @@ async def call_ws(ws: WebSocket):
 
             # ── raw PCM binary frame from AudioWorklet ────────────────────
             if "bytes" in msg and msg["bytes"]:
-                # BUG FIX 1: Only buffer when call is active AND agent is NOT speaking.
-                # Before: we buffered during TTS → vad_end fired on agent-audio echo → empty STT
-                if call_active and not agent_speaking:
-                    mic_buffer.append(msg["bytes"])
+                # CONTINUOUS STREAM: Feed all bytes directly into Deepgram server-side engine
+                if call_active and dg_stt:
+                    await dg_stt.send(msg["bytes"])
                 continue
 
             # ── JSON control messages ─────────────────────────────────────
@@ -3917,48 +3979,46 @@ async def call_ws(ws: WebSocket):
                 current_lang  = data.get("language", "en")
                 call_active   = True
                 history       = []
-                mic_buffer    = []
-                log.info("━━━ CALL STARTED  lang=%s ━━━", current_lang)
+                log.info("━━━ CALL STARTED (STREAMING ACTIVE)  lang=%s ━━━", current_lang)
+                
+                # Boot the backend deepgram websocket
+                await dg_stt.start()
+                
                 await send_json({"type": "call_accepted"})
                 greeting = GREETINGS.get(current_lang, GREETINGS["en"])
                 log.info("[GREET]  %r", greeting)
                 history.append(ConversationTurn(
                     role="assistant", text=greeting, language=current_lang))
                 await speak(greeting, current_lang)
-                mic_buffer = []   # discard anything captured during greeting
                 await send_json({"type": "status", "message": "Listening…"})
 
             # ─────────────────────────────────────────────────────────────
             elif msg_type == "vad_end":
-                # BUG FIX 2: Ignore vad_end while agent is speaking.
-                # The worklet fires vad_end based on its own audio analysis —
-                # it can't know the agent is speaking (it captures mic, not speakers).
-                if agent_speaking:
-                    log.debug("[VAD]  vad_end ignored — agent still speaking")
-                    mic_buffer = []
-                    continue
+                # LEGACY: Deepgram performs VAD server-side now. We ignore client triggers.
+                continue
 
-                if not mic_buffer:
-                    log.debug("[VAD]  vad_end but mic_buffer empty — skipping")
-                    continue
-
-                audio_bytes = b"".join(mic_buffer)
-                mic_buffer  = []
-                log.info("[VAD]  vad_end  %.2fs audio", len(audio_bytes)/(16_000*2))
-                asyncio.create_task(run_pipeline(audio_bytes))
+            # ─────────────────────────────────────────────────────────────
+            elif msg_type == "text_input":
+                query = data.get("text")
+                if query:
+                    log.info("[TEXT] user keyboard input: %r", query)
+                    await abort_pipeline()
+                    pipeline_task = asyncio.create_task(run_pipeline(text_input=query))
 
             # ─────────────────────────────────────────────────────────────
             elif msg_type == "interrupt":
-                log.info("[INTERRUPT]  user spoke — aborting TTS")
-                mic_buffer = []
-                await abort_tts()
+                # Already handled natively via on_speech_started cloud callback,
+                # but keeping client interrupt as instant redundant fallback.
+                log.info("[INTERRUPT]  Manual UI interrupt payload received")
+                await abort_pipeline()
                 await send_json({"type": "status", "message": "Listening…"})
 
             # ─────────────────────────────────────────────────────────────
             elif msg_type == "call_end":
                 log.info("━━━ CALL ENDED ━━━")
                 call_active = False
-                await abort_tts()
+                await abort_pipeline()
+                if dg_stt: await dg_stt.stop()
                 bye = {
                     "en": "Goodbye! Have a great day.",
                     "hi": "Theek hai! Dhanyavaad. Aapka din accha rahe.",

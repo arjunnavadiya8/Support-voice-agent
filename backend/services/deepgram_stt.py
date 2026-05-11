@@ -369,233 +369,146 @@
 
 
 
-# # """
-# # deepgram_stt.py — Realtime Streaming STT  (deepgram-sdk v7, Python 3.13)
-# # ═════════════════════════════════════════════════════════════════════════════
-# # SDK v7 API:
-# #   Streaming : AsyncDeepgramClient → dg.listen.v1.connect() async ctx mgr
-# #               yields AsyncV1SocketClient → send_media(bytes) / async for msg
-# #   REST      : DeepgramClient → dg.listen.v1.media.transcribe_file(request=bytes)
 
-# # Response types from streaming socket:
-# #   ListenV1Results       — interim and final transcripts
-# #   ListenV1UtteranceEnd  — Deepgram VAD: utterance definitively ended
-# #   ListenV1SpeechStarted — Deepgram VAD: speech detected
-# # """
+import os, asyncio, logging
+from typing import Callable, Awaitable
+log = logging.getLogger("stt")
+from deepgram import AsyncDeepgramClient
+from deepgram.listen.v1.types import (
+    ListenV1Results,
+    ListenV1UtteranceEnd,
+    ListenV1SpeechStarted,
+)
 
-# # import io
-# # import os
-# # import wave
-# # import asyncio
-# # import logging
-# # from typing import Callable, Awaitable
+_api_key = os.environ.get("DEEPGRAM_API_KEY", "")
 
-# # from deepgram import AsyncDeepgramClient, DeepgramClient
-# # from deepgram.listen.v1.types import (
-# #     ListenV1Results,
-# #     ListenV1UtteranceEnd,
-# #     ListenV1SpeechStarted,
-# # )
+# ══════════════════════════════════════════════════════════════════════════════
+#  STREAMING STT ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
-# # log = logging.getLogger("stt")
+class DeepgramStreamingSTT:
+    """
+    Persistent Deepgram Live WebSocket for continuous realtime STT + Neural VAD.
 
-# # _api_key = os.environ.get("DEEPGRAM_API_KEY", "")
+    Callbacks:
+        on_interim(text, lang)       — triggers while user is mid-sentence (for UI typing effect)
+        on_final(text, lang)         — utterance complete → kicks off the prompt generator pipeline
+        on_speech_started()          — Deepgram Neural VAD found human voice → halts any active agent output
+    """
 
-# # MIC_SAMPLE_RATE = 16_000
-# # MIC_CHANNELS = 1
-# # MIC_SAMPLE_WIDTH = 2
+    def __init__(
+        self,
+        on_interim:        Callable[[str, str], Awaitable[None]] | None = None,
+        on_final:          Callable[[str, str], Awaitable[None]] | None = None,
+        on_speech_started: Callable[[], Awaitable[None]] | None = None,
+    ):
+        self._on_interim = on_interim
+        self._on_final = on_final
+        self._on_speech_started = on_speech_started
+        self._socket = None
+        self._ctx_mgr = None
+        self._listen_task: asyncio.Task | None = None
+        self._running = False
+        self._lock = asyncio.Lock()
 
-# # SUPPORTED_LANGS = {"gu", "hi", "en"}
-# # MIN_AUDIO_BYTES = MIC_SAMPLE_RATE * MIC_CHANNELS * MIC_SAMPLE_WIDTH * 3 // 10  # 0.3s
+    async def start(self):
+        async with self._lock:
+            if self._running:
+                return
+            dg = AsyncDeepgramClient(api_key=_api_key)
+            self._ctx_mgr = dg.listen.v1.connect(
+                model="nova-3",
+                language="multi",
+                encoding="linear16",
+                sample_rate=16000,  # Match our worklet output
+                channels=1,
+                interim_results="true",
+                utterance_end_ms=1000, # Slightly longer for natural pauses
+                vad_events="true",       # Enable neural cloud VAD
+                punctuate="true",
+                smart_format="true",
+            )
+            self._socket = await self._ctx_mgr.__aenter__()
+            self._running = True
+            self._listen_task = asyncio.create_task(self._listen_loop())
+            log.info("[STT-stream] Connection established with Deepgram Real-time Cluster")
 
+    async def send(self, pcm_bytes: bytes):
+        if not self._running or self._socket is None:
+            return
+        try:
+            await self._socket.send_media(pcm_bytes)
+        except Exception as e:
+            log.warning("[STT-stream] data forward failure: %s", e)
 
-# # # ══════════════════════════════════════════════════════════════════════════════
-# # #  STREAMING STT
-# # # ══════════════════════════════════════════════════════════════════════════════
+    async def stop(self):
+        async with self._lock:
+            if not self._running:
+                return
+            self._running = False
+            if self._listen_task and not self._listen_task.done():
+                self._listen_task.cancel()
+                try:    await self._listen_task
+                except asyncio.CancelledError: pass
+            if self._ctx_mgr is not None:
+                try:    await self._socket.send_close_stream()
+                except Exception: pass
+                try:    await self._ctx_mgr.__aexit__(None, None, None)
+                except Exception: pass
+                self._ctx_mgr = None
+                self._socket = None
+            log.info("[STT-stream] Socket shutdown complete.")
 
+    async def _listen_loop(self):
+        try:
+            async for msg in self._socket:
+                if not self._running: break
+                
+                if isinstance(msg, ListenV1Results):
+                    await self._handle_result(msg)
+                
+                elif isinstance(msg, ListenV1SpeechStarted):
+                    # Global Intercept Trigger! 
+                    log.info("[STT-stream] >>> Neural VAD: USER SPEECH STARTED <<<")
+                    if self._on_speech_started:
+                        asyncio.create_task(self._on_speech_started())
+                
+                elif isinstance(msg, ListenV1UtteranceEnd):
+                    log.debug("[STT-stream] Utterance terminated.")
 
-# # class DeepgramStreamingSTT:
-# #     """
-# #     Persistent Deepgram Live WebSocket for realtime STT.
+        except asyncio.CancelledError: pass
+        except Exception as e:
+            if self._running:
+                log.error("[STT-stream] Stream failure: %s", e)
 
-# #     Callbacks:
-# #         on_interim(text, lang)  — ~150ms while user speaks (for UI)
-# #         on_final(text, lang)    — utterance complete → triggers pipeline
-# #     """
+    async def _handle_result(self, result: ListenV1Results):
+        try:
+            alt = result.channel.alternatives[0]
+            text = (alt.transcript or "").strip()
+            
+            # 'is_final' means Deepgram froze this sentence boundary
+            is_final   = result.is_final or False
+            speech_end = result.speech_final or False
 
-# #     def __init__(
-# #         self,
-# #         on_interim: Callable[[str, str], Awaitable[None]] | None = None,
-# #         on_final: Callable[[str, str], Awaitable[None]] | None = None,
-# #     ):
-# #         self._on_interim = on_interim
-# #         self._on_final = on_final
-# #         self._socket = None
-# #         self._ctx_mgr = None
-# #         self._listen_task: asyncio.Task | None = None
-# #         self._running = False
-# #         self._lock = asyncio.Lock()
+            if not text: return
 
-# #     async def start(self):
-# #         async with self._lock:
-# #             if self._running:
-# #                 return
-# #             dg = AsyncDeepgramClient(api_key=_api_key)
-# #             self._ctx_mgr = dg.listen.v1.connect(
-# #                 model="nova-3",
-# #                 language="multi",
-# #                 encoding="linear16",
-# #                 sample_rate=MIC_SAMPLE_RATE,
-# #                 channels=MIC_CHANNELS,
-# #                 interim_results=True,
-# #                 utterance_end_ms=800,
-# #                 vad_events=True,
-# #                 punctuate=True,
-# #                 smart_format=True,
-# #             )
-# #             self._socket = await self._ctx_mgr.__aenter__()
-# #             self._running = True
-# #             self._listen_task = asyncio.create_task(self._listen_loop())
-# #             log.info("[STT-stream] Deepgram Live connected")
+            raw_lang = getattr(alt, "detected_language", None) or "en"
+            lang = raw_lang.split("-")[0].lower()
+            if lang not in {"gu", "hi", "en"}: lang = "en"
 
-# #     async def send(self, pcm_bytes: bytes):
-# #         if not self._running or self._socket is None:
-# #             return
-# #         try:
-# #             await self._socket.send_media(pcm_bytes)
-# #         except Exception as e:
-# #             log.warning("[STT-stream] send error: %s", e)
+            if speech_end or is_final:
+                log.info("[STT-stream] FINAL CAPTURED: %r (lang=%s)", text, lang)
+                if self._on_final:
+                    asyncio.create_task(self._on_final(text, lang))
+            else:
+                log.debug("[STT-stream] rolling partial: %r", text)
+                if self._on_interim:
+                    asyncio.create_task(self._on_interim(text, lang))
 
-# #     async def stop(self):
-# #         async with self._lock:
-# #             if not self._running:
-# #                 return
-# #             self._running = False
-# #             if self._listen_task and not self._listen_task.done():
-# #                 self._listen_task.cancel()
-# #                 try:
-# #                     await self._listen_task
-# #                 except asyncio.CancelledError:
-# #                     pass
-# #             if self._ctx_mgr is not None:
-# #                 try:
-# #                     await self._socket.send_close_stream()
-# #                 except Exception:
-# #                     pass
-# #                 try:
-# #                     await self._ctx_mgr.__aexit__(None, None, None)
-# #                 except Exception as e:
-# #                     log.warning("[STT-stream] close error: %s", e)
-# #                 self._ctx_mgr = None
-# #                 self._socket = None
-# #             log.info("[STT-stream] disconnected")
-
-# #     def is_running(self) -> bool:
-# #         return self._running
-
-# #     async def _listen_loop(self):
-# #         try:
-# #             async for msg in self._socket:
-# #                 if not self._running:
-# #                     break
-# #                 if isinstance(msg, ListenV1Results):
-# #                     await self._handle_result(msg)
-# #                 elif isinstance(msg, ListenV1UtteranceEnd):
-# #                     log.debug("[STT-stream] UtteranceEnd")
-# #                 elif isinstance(msg, ListenV1SpeechStarted):
-# #                     log.debug("[STT-stream] SpeechStarted")
-# #         except asyncio.CancelledError:
-# #             pass
-# #         except Exception as e:
-# #             if self._running:
-# #                 log.error("[STT-stream] listen loop error: %s", e)
-
-# #     async def _handle_result(self, result: ListenV1Results):
-# #         try:
-# #             alt = result.channel.alternatives[0]
-# #             text = (alt.transcript or "").strip()
-# #             is_final = result.is_final or False
-# #             speech_end = result.speech_final or False
-
-# #             if not text:
-# #                 return
-
-# #             raw_lang = getattr(alt, "detected_language", None) or "en"
-# #             lang = raw_lang.split("-")[0].lower()
-# #             if lang not in SUPPORTED_LANGS:
-# #                 lang = "en"
-
-# #             if speech_end or is_final:
-# #                 log.info("[STT-stream] FINAL  lang=%s  %r", lang, text[:80])
-# #                 if self._on_final:
-# #                     await self._on_final(text, lang)
-# #             else:
-# #                 log.debug("[STT-stream] interim  %r", text[:60])
-# #                 if self._on_interim:
-# #                     await self._on_interim(text, lang)
-
-# #         except Exception as e:
-# #             log.error("[STT-stream] result parse: %s", e)
+        except Exception as e:
+            log.error("[STT-stream] data processing failure: %s", e)
 
 
-# # # ══════════════════════════════════════════════════════════════════════════════
-# # #  ONE-SHOT REST — for /transcribe upload endpoint
-# # # ══════════════════════════════════════════════════════════════════════════════
-
-
-# # def _pcm_to_wav(pcm_bytes: bytes) -> bytes:
-# #     buf = io.BytesIO()
-# #     with wave.open(buf, "wb") as wf:
-# #         wf.setnchannels(MIC_CHANNELS)
-# #         wf.setsampwidth(MIC_SAMPLE_WIDTH)
-# #         wf.setframerate(MIC_SAMPLE_RATE)
-# #         wf.writeframes(pcm_bytes)
-# #     return buf.getvalue()
-
-
-# # def _has_container_header(data: bytes) -> bool:
-# #     if len(data) < 4:
-# #         return False
-# #     return (
-# #         data[:4] == b"RIFF"
-# #         or data[:4] == b"OggS"
-# #         or data[:3] == b"ID3"
-# #         or data[:4] == b"fLaC"
-# #         or data[:4] == b"FORM"
-# #         or data[:4] == b"\x1aE\xdf\xa3"
-# #         or (data[0] == 0xFF and (data[1] & 0xE0) == 0xE0)
-# #     )
-
-
-# # async def transcribe(audio_bytes: bytes) -> tuple[str, str]:
-# #     """One-shot REST — for /transcribe file upload endpoint only."""
-# #     if len(audio_bytes) < MIN_AUDIO_BYTES:
-# #         return "", "en"
-# #     payload = (
-# #         audio_bytes if _has_container_header(audio_bytes) else _pcm_to_wav(audio_bytes)
-# #     )
-# #     dg = DeepgramClient(api_key=_api_key)
-# #     try:
-# #         response = await asyncio.to_thread(
-# #             dg.listen.v1.media.transcribe_file,
-# #             request=payload,
-# #             model="nova-3",
-# #             language="multi",
-# #             punctuate=True,
-# #             smart_format=True,
-# #             detect_language=True,
-# #         )
-# #         channel = response.results.channels[0]
-# #         alt = channel.alternatives[0]
-# #         transcript = (alt.transcript or "").strip()
-# #         raw_lang = getattr(alt, "detected_language", None) or "en"
-# #         lang = raw_lang.split("-")[0].lower()
-# #         if lang not in SUPPORTED_LANGS:
-# #             lang = "en"
-# #         return transcript, lang
-# #     except Exception as e:
-# #         log.error("[STT-rest] error: %s", e)
-# #         raise
 
 
 
